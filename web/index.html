@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f8a4d">
+  <title>牧野云相册</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="style.css">
+  <!-- @imgly/background-removal 内部动态 import 裸包名，需用 importmap 指向自托管副本 -->
+  <script type="importmap">
+  {
+    "imports": {
+      "onnxruntime-web": "/vendor/ort/ort.bundle.min.mjs",
+      "onnxruntime-web/webgpu": "/vendor/ort/ort.bundle.min.mjs"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/albums">牧野云相册</a>
+    <div class="topbar-right">
+      <button class="btn small ghost" id="theme-btn" type="button">深色</button>
+      <div id="auth-area"></div>
+    </div>
+  </header>
+
+  <main id="view"></main>
+
+  <!-- 模态框与提示挂载点 -->
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+
+  <script src="config.js"></script>
+  <script src="vendor/exifr/lite.umd.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/browser-image-compression@2.0.2/dist/browser-image-compression.js"
+    integrity="sha384-dHP9fwqd9BAiDh9uJ0p10khgbbcFMh34bVEiCnJ1Ah/AT2T2k4t572VEo3WXzxXp"
+    crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"
+    integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG"
+    crossorigin="anonymous"></script>
+  <script src="upload-util.js"></script>
+  <script src="idphoto.js"></script>
+  <script src="style-transfer.js"></script>
+  <script src="bg-replace.js"></script>
+  <script src="app.js"></script>
+  <script>
+    // PWA：注册 Service Worker（排除 localhost 与 Pages 预览子域，避免调试/验证时缓存干扰）
+    (function () {
+      if (!('serviceWorker' in navigator)) return;
+      const h = location.hostname;
+      const isPreview = h.endsWith('.album-web.pages.dev') && h !== 'album-web.pages.dev';
+      if (h.includes('localhost') || isPreview) return;
+      window.addEventListener('load', () => navigator.serviceWorker.register('sw.js'));
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "牧野云相册",
+  "short_name": "云相册",
+  "description": "自托管相册云存储",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#101012",
+  "theme_color": "#0f8a4d",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

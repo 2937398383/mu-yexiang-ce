@@ -1,0 +1,14 @@
+[
+  {
+    "AllowedOrigins": [
+      "https://cdc2937398383qqcom.dpdns.org",
+      "https://www.cdc2937398383qqcom.dpdns.org",
+      "https://album-web.pages.dev",
+      "http://localhost:8080"
+    ],
+    "AllowedMethods": ["GET", "PUT", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]

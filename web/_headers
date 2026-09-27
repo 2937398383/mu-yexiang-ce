@@ -1,0 +1,7 @@
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
+  Referrer-Policy: strict-origin-when-cross-origin
+  Strict-Transport-Security: max-age=15552000; includeSubDomains
+  Permissions-Policy: geolocation=(self), camera=(), microphone=(), browsing-topics=()
+  X-Permitted-Cross-Domain-Policies: none

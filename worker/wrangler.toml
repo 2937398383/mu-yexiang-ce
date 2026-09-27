@@ -1,0 +1,48 @@
+# Cloudflare Worker 配置
+# 部署前需要修改的地方：
+#   1. database_id：创建 D1 数据库后，把后台显示的 Database ID 填进来
+#   2. R2_ACCOUNT_ID：你的 Cloudflare Account ID（后台首页右侧可见）
+
+name = "album-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# 自定义域名（绕过 workers.dev 在国内的 DNS 污染），zone 激活后由 wrangler 自动绑定
+routes = [
+  { pattern = "api.cdc2937398383qqcom.dpdns.org", custom_domain = true }
+]
+
+# 定时清理：每天 UTC 16:17（北京时间约 00:17）检查回收站与孤儿
+[triggers]
+crons = ["17 16 * * *"]
+
+[vars]
+R2_ACCOUNT_ID = "65e1870ebd61513b5e09664b1673a5ed"
+R2_BUCKET = "album-photos"
+
+# 以下 4 个是敏感信息，不用写在这里，部署时用 wrangler secret put 逐个设置：
+#   npx wrangler secret put ADMIN_PASSWORD      （管理员登录密码）
+#   npx wrangler secret put JWT_SECRET          （token 签名密钥，随机长字符串）
+#   npx wrangler secret put R2_ACCESS_KEY_ID    （R2 API Token 的 Access Key ID）
+#   npx wrangler secret put R2_SECRET_ACCESS_KEY（R2 API Token 的 Secret Access Key）
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "album-photos"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "album-db"
+database_id = "0d1d6421-47a8-40f4-b7f3-3c3cbc8c246d"
+
+# Cloudflare Images 绑定（云端抠图 segment=foreground，底层 BiRefNet；免费额度每月 5000 次）
+[images]
+binding = "IMAGES"
+
+# Cloudflare Workers AI 绑定（照片换风格，FLUX.2 [klein] 图生图；免费 10000 neurons/天）
+[ai]
+binding = "AI"
+
+# Media Transformations 绑定（视频抽封面帧，2026 公测免费；限制输入 <100MB <10分钟）
+[media]
+binding = "MEDIA"

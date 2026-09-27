@@ -1,0 +1,18 @@
+# 依赖
+node_modules/
+
+# wrangler / Cloudflare
+.wrangler/
+worker/.cf-home/
+.dev.vars
+.dev.vars.*
+.mf/
+
+# 日志
+*.log
+npm-debug.log*
+
+# 编辑器 / 系统 / 代理工作目录
+.trae/
+.DS_Store
+Thumbs.db
