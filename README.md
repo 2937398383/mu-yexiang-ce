@@ -9,6 +9,9 @@
 - **三级图片**：原图 + 1600px 中图 + 400px 缩略图（WebP），网格秒开
 - **游标分页**：每页 60 张，IntersectionObserver 无限滚动
 - **EXIF 保留**：拍摄时间、相机镜头、GPS，按拍摄时间排序
+- **HEIC/HEIF 支持**：iPhone 默认格式浏览器端自动转 JPEG（heic2any 按需加载），EXIF 转换前提取不丢失
+- **服务端搜索**：标签 / 文件名全量搜索（不再只过滤已加载页），热门标签云一键检索
+- **照片收藏**：⭐ 收藏标记 + 「只看收藏」筛选；大图查看器可写**照片备注**（≤500 字）
 - **相册封面** / 相册内**时间线分组**
 - **往年今日**：按拍摄日期回顾历史照片
 - **回收站**：软删除 30 天内可恢复，Cron 自动真删
@@ -20,6 +23,8 @@
 ### 分享
 - **整相册分享** / **单张照片分享** / **求照片链接**（访客匿名上传，婚礼聚会收图）
 - 有效期 1 / 7 / 30 天可选，支持设置访问密码
+- **分享二维码**：每条链接可一键生成二维码（投屏/打印，手机扫码即开）
+- **社交分享卡片**：`/s/:id` 落地页由 Pages Functions 服务端渲染 OG/Twitter meta，微信等 IM 内分享显示相册名与封面（加密/失效链接不泄露封面）
 - 求照片链接按 IP 每小时限流
 
 ### AI 工具
@@ -59,7 +64,8 @@ D1 置为 ready，异步 AI 打标
 │   ├── style-transfer.js    # 换风格页
 │   ├── bg-replace.js        # 换背景页
 │   ├── sw.js                # Service Worker (PWA)
-│   └── vendor/              # 自托管第三方资源（exifr / onnxruntime / imgly）
+│   ├── functions/s/[[id]].js # Pages Functions：/s/:id 分享 OG 卡片落地页
+│   └── vendor/              # 自托管第三方资源（exifr / onnxruntime / imgly / heic2any / qrcode）
 └── worker/
     ├── src/
     │   ├── index.js         # Worker 入口、路由、ensurePhotoSchema 自动迁移

@@ -46,3 +46,7 @@ binding = "AI"
 # Media Transformations 绑定（视频抽封面帧，2026 公测免费；限制输入 <100MB <10分钟）
 [media]
 binding = "MEDIA"
+
+# 启用 Workers Cache：Images binding 的变换结果可被缓存，避免重复计费
+[cache]
+enabled = true

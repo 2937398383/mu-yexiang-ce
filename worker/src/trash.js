@@ -33,6 +33,9 @@ export async function purgePhotos(env, rows) {
       WHERE cover_photo_id IN (${ids.map(() => '?').join(',')})`
   ).bind(...ids).run();
   await env.DB.prepare(
+    `DELETE FROM photo_tag WHERE photo_id IN (${ids.map(() => '?').join(',')})`
+  ).bind(...ids).run();
+  await env.DB.prepare(
     `DELETE FROM photo WHERE id IN (${ids.map(() => '?').join(',')})`
   ).bind(...ids).run();
 }
@@ -109,6 +112,13 @@ export async function restorePhoto(env, photoId, targetAlbumId) {
   await env.DB.prepare(
     "UPDATE photo SET status = 'ready', trashed_at = NULL, album_id = ? WHERE id = ?"
   ).bind(target, photoId).run();
+  // 递增相册版本号（列表 ETag 失效）
+  try {
+    await env.DB.prepare(
+      `INSERT INTO album_version(album_id, v) VALUES(?, 1)
+       ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
+    ).bind(target).run();
+  } catch { /* ignore */ }
   return { ok: true, albumId: target };
 }
 

@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS photo (
   object_key   TEXT NOT NULL,                          -- R2 对象键：albums/<albumId>/<uuid>.<ext>
   thumb_key    TEXT,                                   -- 缩略图键：<uuid>.s.<webp|jpg>（400px）
   large_key    TEXT,                                   -- 中图键：<uuid>.m.<fmt>（1600px）
+  thumb_avif_key TEXT,                                 -- AVIF 缩略图键：<uuid>.s.avif（Chrome/Edge 加载，WebP 兜底）
+  large_avif_key TEXT,                                 -- AVIF 中图键（预留）
+  proxy_key    TEXT,                                   -- 视频 H.264 代理键：<uuid>.proxy.mp4（跨浏览器播放）
+  exif         TEXT,                                   -- 全量 EXIF 曝光参数（JSON：快门/光圈/ISO/焦距/镜头）
   content_type TEXT,
   size         INTEGER,
   status       TEXT NOT NULL DEFAULT 'uploading',      -- uploading | ready | trashed
@@ -30,6 +34,8 @@ CREATE TABLE IF NOT EXISTS photo (
   gps_lat      REAL,                                   -- EXIF 纬度
   gps_lng      REAL,                                   -- EXIF 经度
   tags         TEXT,                                   -- AI 标签（JSON 数组）
+  is_favorite  INTEGER NOT NULL DEFAULT 0,             -- 用户收藏标记：0 | 1
+  caption      TEXT,                                   -- 用户照片备注（≤500 字）
   sha256       TEXT,                                   -- 上传体 SHA-256（同相册去重）
   trashed_at   TEXT,                                   -- 软删除时间（回收站，30 天后真删）
   created_at   TEXT NOT NULL DEFAULT (datetime('now'))
@@ -63,6 +69,13 @@ CREATE TABLE IF NOT EXISTS auth_fail (
 CREATE TABLE IF NOT EXISTS ai_tag_daily (
   day    TEXT PRIMARY KEY,                             -- YYYYMMDD
   count  INTEGER NOT NULL DEFAULT 0
+);
+
+-- ---------- 标签语义归组：标签词向量缓存（bge-m3，跨相册复用） ----------
+CREATE TABLE IF NOT EXISTS tag_emb (
+  tag       TEXT PRIMARY KEY,
+  model     TEXT NOT NULL,                            -- 如 bge-m3-1024
+  embedding TEXT NOT NULL                             -- JSON 数组
 );
 
 -- ---------- 全局限流计数（ip + 分钟窗口） ----------
@@ -108,5 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_photo_trashed ON photo(status, trashed_at);
 CREATE INDEX IF NOT EXISTS idx_photo_sort
   ON photo (COALESCE(taken_at, created_at) DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_photo_sha    ON photo(album_id, sha256);
+-- 收藏筛选（部分索引，仅收藏行入索引）
+CREATE INDEX IF NOT EXISTS idx_photo_favorite ON photo(album_id) WHERE is_favorite = 1;
 CREATE INDEX IF NOT EXISTS idx_share_album  ON share_link(album_id);
 CREATE INDEX IF NOT EXISTS idx_share_photo  ON share_link(photo_id);

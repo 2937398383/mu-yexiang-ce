@@ -16,3 +16,7 @@ npm-debug.log*
 .trae/
 .DS_Store
 Thumbs.db
+
+# 临时测试与调试脚本
+worker/.tmp-ai-test/
+worker/test-*.mjs

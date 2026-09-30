@@ -10,7 +10,8 @@ import { checkLock, recordFailure, clearFailures } from './auth-guard.js';
 const SHARE_TOKEN_TTL = 24 * 3600; // 换取的访问 token 最长 24h
 const DAYS_WHITELIST = new Set([1, 7, 30]);
 const KINDS = new Set(['album', 'photo', 'collect']);
-const BASE_URL = 'https://album-web.pages.dev/#/share/';
+// 路径式链接：Pages Functions(/s/:id) 向社交软件爬虫输出 OG 卡片，真人浏览器跳回 #/share/:id
+const BASE_URL = 'https://album-web.pages.dev/s/';
 const COLLECT_HOUR_LIMIT = 50;
 
 function fail(error, status = 400, extra = {}) {

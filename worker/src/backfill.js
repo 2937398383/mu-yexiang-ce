@@ -59,7 +59,7 @@ export async function runBackfillBatch(env, opts = {}) {
 
   const whereSql = 'WHERE ' + where.join(' AND ');
   const { results } = await env.DB.prepare(
-    `SELECT id, object_key FROM photo ${whereSql}
+    `SELECT id, album_id, object_key FROM photo ${whereSql}
       ORDER BY created_at ASC
       LIMIT ?`
   ).bind(...binds, BATCH_SIZE).all();
@@ -97,13 +97,20 @@ export async function runBackfillBatch(env, opts = {}) {
       const largeKey = thumbKeyOf(p.object_key, 'm');
       await Promise.all([
         env.R2.put(smallKey, smallBytes,
-          { httpMetadata: { contentType: 'image/webp' } }),
+          { httpMetadata: { contentType: 'image/webp', cacheControl: 'public, max-age=31536000, immutable' } }),
         env.R2.put(largeKey, largeBytes,
-          { httpMetadata: { contentType: 'image/webp' } }),
+          { httpMetadata: { contentType: 'image/webp', cacheControl: 'public, max-age=31536000, immutable' } }),
       ]);
       await env.DB.prepare(
         'UPDATE photo SET thumb_key = ?, large_key = ? WHERE id = ?'
       ).bind(smallKey, largeKey, p.id).run();
+      // 缩略图生成 → 相册列表 ETag 失效
+      try {
+        await env.DB.prepare(
+          `INSERT INTO album_version(album_id, v) VALUES(?, 1)
+           ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
+        ).bind(p.album_id).run();
+      } catch { /* ignore */ }
       processed++;
       doneIds.push(p.id);
     } catch {

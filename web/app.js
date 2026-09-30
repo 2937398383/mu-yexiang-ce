@@ -33,6 +33,19 @@ function fmtSize(n) {
   return Math.max(1, Math.round(n / 1024)) + ' KB';
 }
 
+// AI 批量任务进度展示：文本 + 进度条
+function renderAiProgress(tipEl, { action, total, done, failed, remaining, quotaLeft, failReasons }) {
+  const processed = done + failed;
+  const pct = total ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  const text = `${action} ${done} 张${failed ? ` · ${failed} 张失败` : ''} · 剩余 ${remaining} 张 · 今日额度剩 ${quotaLeft}`;
+  const reasonsHtml = (failReasons?.length ? `<div class="ai-progress-reasons">失败原因：${esc(failReasons.join(' · '))}</div>` : '');
+  tipEl.innerHTML = `
+    <div class="ai-progress-text">${esc(text)}</div>
+    <div class="ai-progress-bar"><div class="ai-progress-fill" style="width:${pct}%"></div></div>
+    <div class="ai-progress-pct">${processed}/${total}（${pct}%）</div>
+    ${reasonsHtml}`;
+}
+
 // 视频时长：125 → "2:05"
 function fmtDuration(s) {
   s = Math.max(0, Math.round(Number(s) || 0));
@@ -106,6 +119,10 @@ function renderAuthArea() {
 
 // ==================== API 调用 ====================
 
+// P3：Worker 列表接口带 max-age=30 私有缓存。任何写操作成功后 35s 内的 GET 用
+// cache:'reload' 强制回源（新鲜结果会写回缓存），避免变更后短时间内看到旧列表
+let apiDirtyUntil = 0;
+
 async function api(method, path, body, albumIdForUnlock) {
   const headers = {};
   const admin = getAdminToken();
@@ -118,6 +135,7 @@ async function api(method, path, body, albumIdForUnlock) {
   try {
     resp = await fetch(window.API_BASE + path, {
       method, headers, body: body != null ? JSON.stringify(body) : undefined,
+      ...(method === 'GET' && Date.now() < apiDirtyUntil ? { cache: 'reload' } : {}),
     });
   } catch {
     throw { status: 0, message: '网络错误：请检查 config.js 里的 Worker 地址' };
@@ -127,6 +145,7 @@ async function api(method, path, body, albumIdForUnlock) {
     // 错误对象附带完整响应体（如还原接口 409 时的可选相册列表）
     throw { status: resp.status, message: data.error || '请求失败(' + resp.status + ')', data };
   }
+  if (method !== 'GET') apiDirtyUntil = Date.now() + 35000;
   return data;
 }
 
@@ -284,12 +303,17 @@ async function renderAlbums() {
           <button class="btn danger" id="btn-batch-clear">一键清除所有密码</button>
           <a class="btn" href="#/trash">♻ 回收站</a>
           <a class="btn" href="#/on-this-day">📅 往年今日</a>
+          <a class="btn" href="#/map">🗺️ 地图</a>
+          <a class="btn" href="#/smart">✨ 智能相册</a>
+          <a class="btn" href="#/duplicates">🔁 重复照片</a>
           <a class="btn" href="#/stats">📊 用量统计</a>
           <a class="btn" href="#/idphoto">证件照工具</a>
           <a class="btn" href="#/style-transfer">🎨 照片换风格</a>
           <a class="btn" href="#/bg-replace">🖼️ 更换背景</a>
           <button class="btn primary" id="btn-new-album">+ 新建相册</button>` : `
           <a class="btn" href="#/on-this-day">📅 往年今日</a>
+          <a class="btn" href="#/map">🗺️ 地图</a>
+          <a class="btn" href="#/smart">✨ 智能相册</a>
           <a class="btn" href="#/idphoto">证件照工具</a>
           <a class="btn" href="#/style-transfer">🎨 照片换风格</a>
           <a class="btn" href="#/bg-replace">🖼️ 更换背景</a>`}
@@ -305,7 +329,7 @@ async function renderAlbums() {
       card.className = 'album-card';
       // 封面：有真实 URL 显示图片；加密相册访客显示锁形占位
       const coverHtml = a.coverUrl
-        ? `<img class="album-cover" src="${esc(a.coverUrl)}" loading="lazy" alt="">`
+        ? `<img class="album-cover" src="${esc(a.coverUrl)}" loading="lazy" decoding="async" alt="">`
         : `<div class="album-cover placeholder">${a.lockedCover ? '🔒' : '🖼'}</div>`;
       card.innerHTML = `
         <div class="album-cover-wrap">${coverHtml}
@@ -433,7 +457,8 @@ let shareMode = false; // 分享链接只读模式（隐藏管理/工具按钮�
 let collectMode = false; // 求照片页：访客可匿名上传，不展示任何照片
 let selectMode = false;  // 多选批量模式（管理员）
 const selectedIds = new Set();
-let searchTerm = '';   // 相册内标签/文件名搜索词
+// 服务端搜索状态（active 时照片区显示搜索/收藏结果，无限滚动已断开）
+let searchState = { active: false, favoriteOnly: false, semantic: false };
 const ALBUM_PAGE_SIZE = 60;
 let pageState = { cursor: null, loading: false, hasMore: false };
 let infiniteObserver = null;
@@ -448,6 +473,8 @@ function fmtDateHeader(day) {
 
 // 构建照片容器（平铺为单个网格；按日期为多个分组）
 function buildPhotoArea() {
+  // 容器即将 innerHTML 重建，先断开旧观察目标（IO 强引用目标节点，不断开会泄漏）
+  disconnectRecycleObserver();
   const wrap = document.getElementById('photo-area');
   if (!wrap) return;
   if (albumGroupMode === 'date') {
@@ -457,17 +484,112 @@ function buildPhotoArea() {
   }
 }
 
+// ThumbHash base64 → Uint8Array
+function thumbHashToBytes(thumbHash) {
+  const bin = atob(thumbHash);
+  const hash = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) hash[i] = bin.charCodeAt(i);
+  return hash;
+}
+
+// ThumbHash → 占位 canvas（base64 解码 + 32px RGBA 铺满，浏览器缩放自带柔化）
+function makeThumbPlaceholder(thumbHash) {
+  try {
+    const img = window.ThumbHash.thumbHashToRGBA(thumbHashToBytes(thumbHash));
+    const cv = document.createElement('canvas');
+    cv.className = 'thumb-ph';
+    cv.width = img.w; cv.height = img.h;
+    cv.getContext('2d').putImageData(
+      new ImageData(new Uint8ClampedArray(img.rgba), img.w, img.h), 0, 0);
+    return cv;
+  } catch { return null; }
+}
+
+// 是否启用 SW 缩略图缓存所需的 CORS 模式（与 index.html 中 SW 注册排除条件一致：
+// localhost 与 Pages 预览子域不注册 SW，且 R2 CORS 白名单不含预览子域，
+// 这些环境加 crossorigin 反而会因 CORS 校验失败导致图片不显示）
+const SW_IMG_CACHE_ENABLED = (() => {
+  const h = location.hostname;
+  if (h.includes('localhost')) return false;
+  return !(h.endsWith('.album-web.pages.dev') && h !== 'album-web.pages.dev');
+})();
+const IMG_CORS_ATTR = SW_IMG_CACHE_ENABLED ? ' crossorigin="anonymous"' : '';
+
+// P2 离屏图片回收：滚出视口约 1.5 屏后释放缩略图 src（元素尺寸由 aspect-ratio 保持，无 CLS），
+// 回屏时恢复——SW 缩略图缓存 / 浏览器 HTTP 缓存使命中近乎即时；首屏 eager 图不回收
+let recycleObserver = null;
+function getRecycleObserver() {
+  if (!recycleObserver) {
+    recycleObserver = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        const img = en.target.querySelector('img');
+        const srcEl = en.target.querySelector('picture source');
+        if (en.isIntersecting) {
+          if (img?.dataset.rcSrc) {
+            img.src = img.dataset.rcSrc;
+            if (img.dataset.rcSrcset) img.srcset = img.dataset.rcSrcset;
+            delete img.dataset.rcSrc;
+            delete img.dataset.rcSrcset;
+          }
+          if (srcEl?.dataset.rcSrcset) {
+            srcEl.srcset = srcEl.dataset.rcSrcset;
+            delete srcEl.dataset.rcSrcset;
+          }
+        } else {
+          if (img && img.loading === 'lazy' && img.src && !img.dataset.rcSrc) {
+            img.dataset.rcSrc = img.src;
+            if (img.srcset) img.dataset.rcSrcset = img.srcset;
+            img.removeAttribute('src');
+            img.removeAttribute('srcset');
+          }
+          if (srcEl && srcEl.srcset && !srcEl.dataset.rcSrcset) {
+            srcEl.dataset.rcSrcset = srcEl.srcset;
+            srcEl.removeAttribute('srcset');
+          }
+        }
+      }
+    }, { rootMargin: '150% 0px' });
+  }
+  return recycleObserver;
+}
+function disconnectRecycleObserver() {
+  if (recycleObserver) { recycleObserver.disconnect(); recycleObserver = null; }
+}
+
 // 单个照片元素（平铺与分组共用，保证行为一致）
-function createPhotoItem(p, admin) {
+// eager=true：首屏前几张高优先级加载（fetchpriority=high 且不走懒加载）
+function createPhotoItem(p, admin, eager = false) {
   const item = document.createElement('div');
   item.className = 'photo-item' + (p.kind === 'video' ? ' is-video' : '')
     + (selectMode ? ' selecting' : '');
   item.dataset.photoId = p.id;
+  const srcset = p.largeUrl
+    ? `${esc(p.thumbUrl)} 1x, ${esc(p.largeUrl)} 2x`
+    : '';
+  const imgTag = `<img src="${esc(p.thumbUrl)}" ${srcset ? `srcset="${srcset}" sizes="(max-width:600px) 46vw, 220px"` : ''} ${eager ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async"${IMG_CORS_ATTR} alt="${esc(p.filename)}">`;
+  // AVIF 网格缩略图：Chrome/Edge 走 source 加载更小的 AVIF，Safari 回退 WebP/JPEG
+  const mediaHtml = p.thumbAvifUrl
+    ? `<picture><source type="image/avif" srcset="${esc(p.thumbAvifUrl)}">${imgTag}</picture>`
+    : imgTag;
   item.innerHTML = `
-    <img src="${esc(p.thumbUrl)}" loading="lazy" alt="${esc(p.filename)}">
+    ${mediaHtml}
     ${selectMode ? '<span class="pick-check"></span>' : ''}
+    ${p.isFavorite ? '<span class="fav-badge" title="已收藏">★</span>' : ''}
     ${p.kind === 'video' ? `<span class="video-badge">▶${p.duration ? '<i>' + esc(fmtDuration(p.duration)) + '</i>' : ''}</span>` : ''}
     ${admin ? '<button class="del" title="删除">×</button>' : ''}`;
+  // 模糊占位：先铺 thumbhash，缩略图加载完成后淡入并移除占位
+  const imgEl = item.querySelector('img');
+  if (p.thumbHash && window.ThumbHash) {
+    const ph = makeThumbPlaceholder(p.thumbHash);
+    if (ph) {
+      item.insertBefore(ph, imgEl);
+      imgEl.classList.add('thumb-loading');
+      imgEl.addEventListener('load', () => {
+        imgEl.classList.remove('thumb-loading');
+        ph.remove();
+      }, { once: true });
+    }
+  }
   if (selectMode && selectedIds.has(p.id)) item.classList.add('selected');
   item.querySelector('img').addEventListener('click', () => {
     if (selectMode) {
@@ -481,25 +603,28 @@ function createPhotoItem(p, admin) {
     if (!await confirmModal('删除照片', `「${p.filename}」将移入回收站，10 天内可还原。`, '移入回收站', true)) return;
     try {
       await api('DELETE', `/photos/${p.id}`);
+      recycleObserver?.unobserve(item);
       item.remove();
       currentPhotos = currentPhotos.filter((x) => x.id !== p.id);
       toast('已移入回收站');
     } catch (err) { toast(err.message, true); }
   });
+  getRecycleObserver().observe(item);
   return item;
 }
 
 // 追加照片：平铺直接入网格；按日期找/建对应日期分组（列表为时间倒序，新日期组在底部）
-function addPhotoItems(photos, admin) {
+// eagerFirst：前 N 张用高优先级加载（仅首屏/搜索结果首屏传 8，无限滚动批次不传）
+function addPhotoItems(photos, admin, eagerFirst = 0) {
   if (albumGroupMode === 'flat') {
     const grid = document.getElementById('photo-grid');
     if (!grid) return;
-    for (const p of photos) grid.appendChild(createPhotoItem(p, admin));
+    photos.forEach((p, i) => grid.appendChild(createPhotoItem(p, admin, i < eagerFirst)));
     return;
   }
   const groups = document.getElementById('photo-groups');
   if (!groups) return;
-  for (const p of photos) {
+  photos.forEach((p, i) => {
     const day = String(p.createdAt ?? '').slice(0, 10) || '未知日期';
     let group = groups.querySelector(`[data-day="${day}"]`);
     if (!group) {
@@ -510,8 +635,8 @@ function addPhotoItems(photos, admin) {
         <div class="photo-grid"></div>`;
       groups.appendChild(group);
     }
-    group.querySelector('.photo-grid').appendChild(createPhotoItem(p, admin));
-  }
+    group.querySelector('.photo-grid').appendChild(createPhotoItem(p, admin, i < eagerFirst));
+  });
 }
 
 // ==================== 多选批量模式（管理员） ====================
@@ -682,24 +807,138 @@ async function batchRename() {
   });
 }
 
-// 当前搜索词过滤后的照片（标签/文件名，不区分大小写）
-function filteredPhotos() {
-  const term = searchTerm.trim().toLowerCase();
-  if (!term) return currentPhotos;
-  return currentPhotos.filter((p) =>
-    p.filename.toLowerCase().includes(term) ||
-    (p.tags ?? []).some((t) => t.toLowerCase().includes(term)));
-}
-
-// 重建照片容器并按当前搜索词渲染（无限滚动追加后也走这里，保证过滤不丢）
+// 重建照片容器并渲染 currentPhotos（时间线 / 搜索结果共用）
 function rerenderPhotoArea() {
   buildPhotoArea();
-  addPhotoItems(filteredPhotos(), isAdmin());
+  addPhotoItems(currentPhotos, isAdmin(), 8);
+}
+
+// 搜索区 HTML（相册页 / 分享只读页共用）
+function albumSearchHtml() {
+  return `
+    <div class="search-row">
+      <input id="f-search" type="search" placeholder="搜索标签 / 文件名（全相册，含未加载）…" autocomplete="off">
+      <button id="btn-semantic" class="btn" type="button" title="切换语义搜索（按内容含义匹配，需 AI 标签）">🔍 语义</button>
+      <span id="search-note" class="search-note"></span>
+    </div>
+    <div id="tag-chips" class="tag-chips" hidden></div>`;
+}
+
+// 标签云 + 搜索框防抖绑定（api 第 4 参带当前相册解锁/分享 token）
+function bindAlbumSearch(albumId) {
+  const input = document.getElementById('f-search');
+  const chipsBox = document.getElementById('tag-chips');
+  const semBtn = document.getElementById('btn-semantic');
+  if (!input) return;
+
+  // 语义搜索切换
+  if (semBtn) {
+    semBtn.addEventListener('click', () => {
+      searchState.semantic = !searchState.semantic;
+      semBtn.classList.toggle('primary', searchState.semantic);
+      semBtn.textContent = searchState.semantic ? '🔍 语义：开' : '🔍 语义';
+      const note = document.getElementById('search-note');
+      if (note) note.textContent = searchState.semantic ? '语义搜索模式：按内容含义匹配（仅当前相册）' : '';
+      input.placeholder = searchState.semantic
+        ? '语义搜索当前相册：输入描述（如「海边日落」「一家人合影」）…'
+        : '搜索标签 / 文件名（全相册，含未加载）…';
+      const term = input.value.trim();
+      if (term) doServerSearch(albumId, { q: term });
+    });
+  }
+
+  // 语义归组标签云：同义标签已合并为一组，点代表词搜整组（组内任一标签命中即返回）
+  api('GET', `/tag-groups?albumId=${encodeURIComponent(albumId)}`, null, albumId)
+    .then((d) => {
+      if (!chipsBox || !d.groups?.length) return;
+      chipsBox.hidden = false;
+      chipsBox.innerHTML = d.groups.map((g) =>
+        `<button type="button" class="tag-chip" data-tags="${esc(g.tags.join(','))}" data-rep="${esc(g.rep)}" title="包含相近标签：${esc(g.tags.join('、'))}">${esc(g.rep)}<i>${g.n}</i></button>`
+      ).join('');
+      chipsBox.querySelectorAll('.tag-chip').forEach((b) =>
+        b.addEventListener('click', () => {
+          input.value = b.dataset.rep;
+          doServerSearch(albumId, { q: b.dataset.rep, tags: b.dataset.tags });
+        }));
+    })
+    .catch(() => {});
+
+  let timer = null;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    const term = input.value.trim();
+    timer = setTimeout(() => {
+      if (term) doServerSearch(albumId, { q: term });
+      else if (searchState.active) restoreAlbumGrid(albumId);
+    }, 350);
+  });
+}
+
+// ⭐只看收藏 按钮（再点一次返回时间线）
+function bindFavOnlyBtn(albumId) {
+  document.getElementById('btn-fav-only')?.addEventListener('click', (e) => {
+    if (searchState.favoriteOnly) restoreAlbumGrid(albumId);
+    else {
+      e.currentTarget.textContent = '← 返回相册';
+      doServerSearch(albumId, { favorite: true });
+    }
+  });
+}
+
+// 服务端搜索 / 收藏筛选 / 标签组搜索：断开无限滚动，结果直接替换照片区（上限 100 张）
+async function doServerSearch(albumId, { q = '', favorite = false, tags = '' } = {}) {
+  if (infiniteObserver) { infiniteObserver.disconnect(); infiniteObserver = null; }
+  searchState.active = true;
+  searchState.favoriteOnly = favorite;
   const note = document.getElementById('search-note');
-  if (note) {
-    const term = searchTerm.trim();
-    note.textContent = term && pageState.hasMore
-      ? '仅搜索了已加载的照片，滚动到底加载更多后可继续匹配' : '';
+  if (note) note.textContent = '搜索中…';
+  try {
+    let d;
+    if (searchState.semantic && q) {
+      // 语义搜索：只在当前相册内，按向量相似度排序
+      d = await api('GET', `/search/semantic?q=${encodeURIComponent(q)}&albumId=${encodeURIComponent(albumId)}`, null, albumId);
+    } else {
+      const qs = new URLSearchParams({ albumId, limit: '100' });
+      if (q) qs.set('q', q);
+      if (tags) qs.set('tags', tags);
+      if (favorite) qs.set('favorite', '1');
+      d = await api('GET', `/search?${qs.toString()}`, null, albumId);
+    }
+    currentPhotos = d.photos;
+    buildPhotoArea();
+    addPhotoItems(d.photos, isAdmin(), 8);
+    const statusEl = document.getElementById('page-status');
+    if (statusEl) statusEl.textContent = '';
+    if (note) {
+      if (favorite) note.textContent = `⭐ 收藏的照片 · 共 ${d.photos.length} 张`;
+      else if (tags) note.textContent = `标签组「${q}」匹配 ${d.photos.length} 张（${tags.split(',').filter(Boolean).length} 个相近标签）`;
+      else if (searchState.semantic) note.textContent = `语义「${q}」在本相册匹配 ${d.photos.length} 张（按相似度排序）`;
+      else note.textContent = `「${q}」匹配 ${d.photos.length} 张${d.photos.length >= 100 ? '（仅显示前 100 张，请细化关键词）' : ''}`;
+    }
+  } catch (err) {
+    if (note) note.textContent = '搜索失败：' + (err.message || err);
+  }
+}
+
+// 退出搜索/收藏视图：重新拉取相册首屏并恢复无限滚动（不整页重渲染）
+async function restoreAlbumGrid(albumId) {
+  searchState = { active: false, favoriteOnly: false, semantic: false };
+  const note = document.getElementById('search-note');
+  if (note) note.textContent = '';
+  const input = document.getElementById('f-search');
+  if (input) input.value = '';
+  const favBtn = document.getElementById('btn-fav-only');
+  if (favBtn) favBtn.textContent = '⭐ 只看收藏';
+  try {
+    const d = await api('GET', `/albums/${albumId}/photos?limit=${ALBUM_PAGE_SIZE}`, null, albumId);
+    currentPhotos = [...d.photos];
+    prefetchedPage = null;
+    pageState = { cursor: d.nextCursor, loading: false, hasMore: !!d.nextCursor };
+    buildPhotoArea();
+    addPhotoItems(d.photos, isAdmin(), 8);
+    if (pageState.hasMore) setupInfiniteLoad();
+  } catch (err) {
+    toast(err.message || '加载失败', true);
   }
 }
 
@@ -725,7 +964,8 @@ async function renderAlbum(albumId) {
   currentAlbumId = albumId;
   currentPhotos = [];
   currentCoverPhotoId = data.album.coverPhotoId ?? null;
-  searchTerm = '';
+  searchState = { active: false, favoriteOnly: false, semantic: false };
+  prefetchedPage = null;
   pageState = { cursor: data.nextCursor, loading: false, hasMore: !!data.nextCursor };
   const admin = isAdmin();
   const canEdit = canEditAlbum();
@@ -735,6 +975,7 @@ async function renderAlbum(albumId) {
       <h1>${esc(data.album.name)}${data.album.locked ? ' <span class="lock" style="vertical-align:3px">已上锁</span>' : ''}</h1>
       <div class="page-actions">
         <a class="btn" href="#/albums">← 返回</a>
+        ${data.photos.length ? '<button class="btn" id="btn-fav-only">⭐ 只看收藏</button>' : ''}
         ${admin ? `<button class="btn" id="btn-share">🔗 分享</button>` : ''}
         ${admin && data.photos.length ? `<button class="btn" id="btn-select-mode">☑ 多选</button>` : ''}
         ${canEdit && data.photos.length ? `<button class="btn" id="btn-zip">⬇ 打包下载</button>` : ''}
@@ -744,6 +985,8 @@ async function renderAlbum(albumId) {
           <button class="btn" id="btn-backfill">回填历史缩略图（${data.missingThumbs}张）</button>` : ''}
         ${canEdit && data.untaggedCount > 0 ? `
           <button class="btn" id="btn-backfill-tags">🏷 补打标签（${data.untaggedCount}张）</button>` : ''}
+        ${admin && data.photos.length ? `
+          <button class="btn" id="btn-retag-tags" title="用新 AI 模型重新生成已有标签，覆盖旧标签">🔄 重打标签</button>` : ''}
         ${canEdit ? `
           <label class="btn primary" style="cursor:pointer">
             上传照片<input id="f-upload" type="file" accept="image/*,video/mp4,video/webm,video/quicktime,video/x-m4v" multiple hidden>
@@ -755,10 +998,7 @@ async function renderAlbum(albumId) {
       <button class="btn small ${albumGroupMode === 'flat' ? 'primary' : ''}" id="btn-mode-flat">平铺</button>
       <button class="btn small ${albumGroupMode === 'date' ? 'primary' : ''}" id="btn-mode-date">按上传时间</button>
     </div>
-    <div class="search-row">
-      <input id="f-search" type="search" placeholder="搜索标签 / 文件名…" autocomplete="off">
-      <span id="search-note" class="search-note"></span>
-    </div>
+    ${albumSearchHtml()}
     <div id="backfill-tip" class="backfill-tip" style="display:none"></div>
     ${data.album.description ? `<p style="color:var(--muted);font-size:14px;margin-bottom:14px">${esc(data.album.description)}</p>` : ''}
     <div id="upload-progress"></div>
@@ -768,6 +1008,8 @@ async function renderAlbum(albumId) {
       <div id="page-status" class="page-status"></div>`
       : `<div class="empty">还没有照片${canEdit ? '，点「上传照片」开始（手机会打开相册选择器）' : ''}</div>`}`;
 
+  bindAlbumSearch(albumId);
+  bindFavOnlyBtn(albumId);
   if (data.photos.length) {
     currentPhotos.push(...data.photos);
     rerenderPhotoArea();
@@ -775,23 +1017,58 @@ async function renderAlbum(albumId) {
     bindBackfillButton();
     if (pageState.hasMore) setupInfiniteLoad();
   }
-  document.getElementById('f-search')?.addEventListener('input', (e) => {
-    searchTerm = e.target.value;
-    rerenderPhotoArea();
-  });
   // 补打 AI 标签：循环按批调用，直到剩余 0 或当日额度用尽
   document.getElementById('btn-backfill-tags')?.addEventListener('click', async (e) => {
     const btn = e.target;
     const tip = document.getElementById('backfill-tip');
     btn.disabled = true;
     tip.style.display = '';
+    let done = 0, failed = 0, total = 0;
     try {
       for (;;) {
         const r = await api('POST', '/admin/backfill-tags', { albumId, limit: 20 }, albumId);
-        tip.textContent = `本批打标 ${r.done} 张 · 剩余 ${r.remaining} 张 · 今日额度剩 ${r.quotaLeft}`;
+        done += r.done; failed += r.failed || 0;
+        total = Math.max(total, done + failed + r.remaining);
+        renderAiProgress(tip, { action: '本批打标', total, done, failed, remaining: r.remaining, quotaLeft: r.quotaLeft, failReasons: r.failReasons });
         if (!r.remaining || !r.quotaLeft || r.done === 0) break;
       }
-      toast('补打完成');
+      toast(`补打完成，共 ${done} 张${failed ? `，${failed} 张失败` : ''}`);
+      render();
+    } catch (err) {
+      btn.disabled = false;
+      toast(err.message, true);
+    }
+  });
+  // 重打标签（管理员）：用新模型覆盖本相册已有标签，每批 20 张，受每日额度限制
+  document.getElementById('btn-retag-tags')?.addEventListener('click', async (e) => {
+    const btn = e.target;
+    const ok = await confirmModal(
+      '重打本相册标签',
+      '将用新的 AI 模型重新生成本相册所有已有标签，旧标签会被覆盖；每张消耗今日 AI 额度（每天最多 200 张，可分多天完成）。确定继续？',
+      '开始重打', true
+    );
+    if (!ok) return;
+    const tip = document.getElementById('backfill-tip');
+    btn.disabled = true;
+    tip.style.display = '';
+    let done = 0, failed = 0, total = 0;
+    try {
+      const since = new Date().toISOString(); // 整轮活动游标：只重打游标之前的照片
+      let batches = 0;
+      for (;;) {
+        const r = await api('POST', '/admin/backfill-tags', { albumId, limit: 20, mode: 'retag', since }, albumId);
+        batches++;
+        done += r.done; failed += r.failed || 0;
+        total = Math.max(total, done + failed + r.remaining);
+        renderAiProgress(tip, { action: '本批重打', total, done, failed, remaining: r.remaining, quotaLeft: r.quotaLeft, failReasons: r.failReasons });
+        if (!r.remaining || !r.quotaLeft || r.done === 0) {
+          if (!r.quotaLeft) toast('今日 AI 额度已用完，明天可继续', true);
+          else if (r.failed && !r.done) toast('本批全部失败，已自动退还额度，请稍后再试', true);
+          break;
+        }
+        if (batches >= 10) { toast('已连续重打 200 张，今天先到这，明天可继续'); break; }
+      }
+      toast(`重打完成，共 ${done} 张${failed ? `，${failed} 张失败` : ''}`);
       render();
     } catch (err) {
       btn.disabled = false;
@@ -834,6 +1111,32 @@ function bindGroupModeToggle() {
   document.getElementById('btn-mode-date')?.addEventListener('click', () => switchMode('date'));
 }
 
+// 闲时预取：加载完一页后，网络空闲时预取下一页数据 + 预加载其缩略图
+let prefetchedPage = null; // { cursor, data }
+
+function prefetchNextPage() {
+  if (!pageState.hasMore || pageState.loading || !currentAlbumId) return;
+  if (prefetchedPage && prefetchedPage.cursor === pageState.cursor) return;
+  const cursor = pageState.cursor, albumId = currentAlbumId;
+  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 300));
+  idle(async () => {
+    try {
+      const data = await api('GET',
+        `/albums/${albumId}/photos?limit=${ALBUM_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`,
+        null, albumId);
+      // 预取回来时游标已被搜索/换相册改变则丢弃
+      if (currentAlbumId !== albumId || pageState.cursor !== cursor) return;
+      prefetchedPage = { cursor, data };
+      // 预加载缩略图进浏览器/SW 缓存（前 30 张即可）
+      for (const p of data.photos.slice(0, 30)) {
+        const im = new Image();
+        if (SW_IMG_CACHE_ENABLED) im.crossOrigin = 'anonymous';
+        im.src = p.thumbUrl;
+      }
+    } catch { /* 预取失败无妨，滚动到底会正常加载 */ }
+  });
+}
+
 // 无限滚动：哨兵进入视口（提前 600px）就拉下一页
 function setupInfiniteLoad() {
   const sentinel = document.getElementById('page-sentinel');
@@ -844,9 +1147,13 @@ function setupInfiniteLoad() {
     pageState.loading = true;
     status.textContent = '正在加载更多…';
     try {
-      const data = await api('GET',
-        `/albums/${currentAlbumId}/photos?limit=${ALBUM_PAGE_SIZE}&cursor=${encodeURIComponent(pageState.cursor)}`,
-        null, currentAlbumId);
+      // 优先使用闲时预取的结果
+      const data = (prefetchedPage && prefetchedPage.cursor === pageState.cursor)
+        ? prefetchedPage.data
+        : await api('GET',
+          `/albums/${currentAlbumId}/photos?limit=${ALBUM_PAGE_SIZE}&cursor=${encodeURIComponent(pageState.cursor)}`,
+          null, currentAlbumId);
+      prefetchedPage = null;
       currentPhotos.push(...data.photos);
       rerenderPhotoArea();
       pageState.cursor = data.nextCursor;
@@ -856,6 +1163,7 @@ function setupInfiniteLoad() {
         infiniteObserver.disconnect();
       } else {
         status.textContent = '';
+        prefetchNextPage();
       }
     } catch (err) {
       status.textContent = '';
@@ -865,6 +1173,7 @@ function setupInfiniteLoad() {
     }
   }, { rootMargin: '600px 0px' });
   infiniteObserver.observe(sentinel);
+  prefetchNextPage();
 }
 
 // 历史缩略图回填：循环按批调用，直到剩余 0 或月度 Images 额度用尽
@@ -985,7 +1294,7 @@ function openBackfillModal() {
           lab.className = 'bf-pick';
           lab.innerHTML = `
             <input type="checkbox" data-id="${esc(p.id)}">
-            <img src="${esc(p.thumbUrl)}" loading="lazy" alt="${esc(p.filename)}">
+            <img src="${esc(p.thumbUrl)}" loading="lazy" decoding="async" alt="${esc(p.filename)}">
             <span class="bf-pick-date">${esc(String(p.createdAt ?? '').slice(0, 10))}</span>
             <span class="bf-pick-done">✓ 已生成</span>`;
           lab.querySelector('input').addEventListener('change', refreshPickCount);
@@ -1059,7 +1368,7 @@ function openBackfillModal() {
 // 大图压缩阈值：超过 1.5MB 才压（小图压缩得不偿失）
 const COMPRESS_THRESHOLD = 1.5 * 1024 * 1024;
 
-// 浏览器端压缩（browser-image-compression CDN，UMD 全局 imageCompression）
+// 浏览器端压缩（browser-image-compression，本地 vendor，UMD 全局 imageCompression）
 // GIF/SVG 跳过（保动画/矢量）；失败（如 HEIC 无法解码）降级原图
 async function maybeCompress(file) {
   if (file.size <= COMPRESS_THRESHOLD) return file;
@@ -1077,8 +1386,68 @@ async function maybeCompress(file) {
   }
 }
 
-// 上传：浏览器端先解析 EXIF + 生成缩略图 → 一次拿 3 个预签名 URL → PUT 直传 R2 → confirm
-// 文件间串行（避免手机端内存过大），单文件的 3 个 PUT 并发
+// 大视频分段上传：S3 Multipart，3 路并发、单段失败重试 3 次、整体失败 abort 清理
+// 数据面每段走预签名 PUT 直传 R2，控制面（分段签名/合并/放弃）经 Worker
+async function uploadMultipart(blob, r, albumId, thumbs) {
+  const PART_SIZE = 16 * 1024 * 1024; // 16MB/段（S3 最小 5MB），上限 500MB≈32 段
+  const CONCURRENCY = 3;
+  const RETRIES = 3;
+  const totalParts = Math.ceil(blob.size / PART_SIZE);
+  let nextPart = 1;
+  const parts = [];
+
+  async function uploadOne(partNumber) {
+    const start = (partNumber - 1) * PART_SIZE;
+    const end = Math.min(start + PART_SIZE, blob.size);
+    const chunk = blob.slice(start, end);
+    let lastErr;
+    for (let attempt = 1; attempt <= RETRIES; attempt++) {
+      try {
+        const su = await api('POST', `/photos/${r.photoId}/upload-part`,
+          { uploadId: r.uploadId, partNumber }, albumId);
+        const resp = await fetch(su.url, {
+          method: 'PUT', body: chunk, headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+        });
+        if (!resp.ok) throw { message: `分段 ${partNumber} 直传失败` };
+        const etag = resp.headers.get('etag');
+        if (!etag) throw { message: `分段 ${partNumber} 缺少 ETag` };
+        return { partNumber, etag };
+      } catch (e) {
+        lastErr = e;
+        if (attempt < RETRIES) await new Promise((res) => setTimeout(res, 500 * attempt));
+      }
+    }
+    throw lastErr || { message: `分段 ${partNumber} 上传失败` };
+  }
+
+  async function pool() {
+    for (;;) {
+      const n = nextPart++;
+      if (n > totalParts) return;
+      parts.push(await uploadOne(n));
+    }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, totalParts) }, () => pool()));
+    parts.sort((a, b) => a.partNumber - b.partNumber);
+    // 视频用封面帧计算 dHash + thumbHash（与单 PUT confirm 同口径）
+    const completeBody = { uploadId: r.uploadId, parts };
+    const phash = thumbs.small ? await computeDHash(thumbs.small) : null;
+    if (phash) completeBody.phash = phash;
+    if (thumbs.thumbHash) completeBody.thumbHash = thumbs.thumbHash;
+    await api('POST', `/photos/${r.photoId}/complete-multipart`, completeBody, albumId);
+  } catch (e) {
+    // 失败清理未完成分段，避免 R2 残留计费
+    try {
+      await api('POST', `/photos/${r.photoId}/abort-multipart`, { uploadId: r.uploadId }, albumId);
+    } catch { /* 忽略清理失败 */ }
+    throw e;
+  }
+}
+
+// 上传：浏览器端先解析 EXIF + 生成缩略图 → 拿预签名 URL → PUT 直传 R2 → confirm
+// 文件间串行（避免手机端内存过大），单文件内缩略图/分段并发
 async function uploadFiles(albumId, files) {
   // 疑似重复（同名同大小，仅对照已加载照片）：取消则跳过这些
   const dups = files.filter((f) =>
@@ -1111,7 +1480,7 @@ async function uploadFiles(albumId, files) {
   async function processOne(file) {
     try {
       const isVideo = /^video\//.test(file.type);
-      let exif = null, thumbs = { small: null, large: null }, uploadBlob = file, duration = null;
+      let exif = null, thumbs = { small: null, large: null, thumbHash: null }, uploadBlob = file, duration = null;
       if (isVideo) {
         if (file.size > 500 * 1024 * 1024) throw { message: '视频超过 500MB 建议上限，已跳过' };
         // 抽帧 best-effort：失败则无缩略图上传，由后端 MEDIA 绑定补帧
@@ -1119,26 +1488,34 @@ async function uploadFiles(albumId, files) {
           const vf = await captureVideoFrame(file);
           thumbs.small = vf.small;
           thumbs.large = vf.large;
+          thumbs.thumbHash = vf.thumbHash;
           duration = vf.duration;
         } catch { /* 无法解码（如 HEVC），无缩略图 */ }
       } else {
-        // EXIF/缩略图用原图（元数据完整、缩略图质量高）；上传体用压缩结果
-        [exif, thumbs, uploadBlob] = await Promise.all([
-          extractExif(file), makeThumbnails(file), maybeCompress(file),
+        // HEIC/HEIF（iPhone 默认格式）先转 JPEG；EXIF 必须用原文件解析（转码后会丢失）
+        uploadBlob = await ensureJpeg(file);
+        // 缩略图用（可能已转换的）解码结果；上传体超阈值再压缩
+        [exif, thumbs] = await Promise.all([
+          extractExif(file), makeThumbnails(uploadBlob),
         ]);
+        if (uploadBlob.size > COMPRESS_THRESHOLD) uploadBlob = await maybeCompress(uploadBlob);
       }
       const createBody = {
-        filename: file.name,
+        filename: uploadBlob.name,
         contentType: uploadBlob.type || file.type,
         thumbContentType: thumbs.small ? thumbs.small.type : null,
+        thumbAvifContentType: thumbs.smallAvif ? 'image/avif' : null,
       };
       if (isVideo) {
         createBody.duration = duration;
+        // >100MB 大视频走分段上传（断点续传），弱网下分段重试而非整文件重传
+        if (uploadBlob.size > 100 * 1024 * 1024) createBody.multipart = true;
       } else {
         createBody.takenAt = exif.takenAt;
         createBody.camera = exif.camera;
         createBody.gpsLat = exif.gpsLat;
         createBody.gpsLng = exif.gpsLng;
+        if (exif.exif) createBody.exif = exif.exif;
       }
       // 上传体 ≤50MB 才算哈希，做同相册重复检测；>50MB 跳过
       if (uploadBlob.size > 0 && uploadBlob.size <= 50 * 1024 * 1024) {
@@ -1155,20 +1532,42 @@ async function uploadFiles(albumId, files) {
         }
         throw err;
       }
-      const puts = [
-        fetch(r.uploadUrl, { method: 'PUT', body: uploadBlob, headers: { 'Content-Type': uploadBlob.type || file.type } }),
-      ];
+      // 缩略图/封面帧（小文件，先于主文件完成——confirm/complete 会校验其存在）
+      const thumbPuts = [];
       if (r.thumbUploadUrl) {
-        puts.push(fetch(r.thumbUploadUrl, {
+        thumbPuts.push(fetch(r.thumbUploadUrl, {
           method: 'PUT', body: thumbs.small, headers: { 'Content-Type': thumbs.small.type },
         }));
-        puts.push(fetch(r.largeUploadUrl, {
+        thumbPuts.push(fetch(r.largeUploadUrl, {
           method: 'PUT', body: thumbs.large, headers: { 'Content-Type': thumbs.large.type },
         }));
       }
-      const putResps = await Promise.all(puts);
-      if (putResps.some((x) => !x.ok)) throw { message: '直传 R2 失败' };
-      await api('POST', `/photos/${r.photoId}/confirm`, null, albumId);
+      if (r.thumbAvifUploadUrl && thumbs.smallAvif) {
+        thumbPuts.push(fetch(r.thumbAvifUploadUrl, {
+          method: 'PUT', body: thumbs.smallAvif, headers: { 'Content-Type': 'image/avif' },
+        }));
+      }
+      if (thumbPuts.length) {
+        const thumbResps = await Promise.all(thumbPuts);
+        if (thumbResps.some((x) => !x.ok)) throw { message: '缩略图直传失败' };
+      }
+      // 主文件：大视频走分段续传，其余单 PUT
+      if (r.multipart) {
+        await uploadMultipart(uploadBlob, r, albumId, thumbs);
+      } else {
+        const resp = await fetch(r.uploadUrl, {
+          method: 'PUT', body: uploadBlob, headers: { 'Content-Type': uploadBlob.type || file.type },
+        });
+        if (!resp.ok) throw { message: '直传 R2 失败' };
+        // 图片计算 dHash 用于重复检测；视频用封面帧（若有）
+        const phashBlob = isVideo ? thumbs.small : uploadBlob;
+        const phash = phashBlob ? await computeDHash(phashBlob) : null;
+        const confirmBody = {};
+        if (phash) confirmBody.phash = phash;
+        if (thumbs.thumbHash) confirmBody.thumbHash = thumbs.thumbHash;
+        await api('POST', `/photos/${r.photoId}/confirm`,
+          Object.keys(confirmBody).length ? confirmBody : null, albumId);
+      }
       done++;
     } catch (err) {
       failed++;
@@ -1219,10 +1618,27 @@ function viewerInfoHtml(p) {
   if (p.albumName) parts.push('📁 ' + esc(p.albumName));
   if (p.takenAt) parts.push(fmtDateTime(p.takenAt));
   if (p.camera) parts.push(esc(p.camera));
+  // EXIF 曝光参数：快门 / 光圈 / ISO / 焦距 / 镜头
+  if (p.exif && typeof p.exif === 'object') {
+    const e = p.exif;
+    const chips = [];
+    if (e.aperture) chips.push(`f/${e.aperture}`);
+    if (e.exposureTime) {
+      chips.push(e.exposureTime < 1
+        ? `1/${Math.max(1, Math.round(1 / e.exposureTime))}s`
+        : `${e.exposureTime}s`);
+    }
+    if (e.iso) chips.push(`ISO ${e.iso}`);
+    if (e.focalLength) chips.push(`${Math.round(e.focalLength * 10) / 10}mm`);
+    if (chips.length) parts.push(chips.join(' · '));
+    if (e.lensModel) parts.push(esc(e.lensModel));
+  }
   if (Array.isArray(p.tags) && p.tags.length) {
     parts.push(p.tags.map((t) => `<span class="tag">${esc(t)}</span>`).join(''));
   }
-  return parts.join(' · ');
+  const captionHtml = p.caption ? `<div class="v-caption">📝 ${esc(p.caption)}</div>` : '';
+  const aiDescHtml = p.aiDesc ? `<div class="v-caption">🤖 ${esc(p.aiDesc)}</div>` : '';
+  return captionHtml + aiDescHtml + parts.join(' · ');
 }
 
 // 取新鲜原图 URL（成功后缓存到条目；失败降级缩略图）
@@ -1231,9 +1647,24 @@ async function freshPhotoUrl(p) {
   try {
     const r = await api('GET', `/photos/${p.id}/url`, null, p.albumId || currentAlbumId);
     p.url = r.url;
+    if (r.proxyUrl) p.proxyUrl = r.proxyUrl;
     return r.url;
   } catch {
     return p.thumbUrl;
+  }
+}
+
+// 预载查看器相邻图片（prev / next / next2）：freshPhotoUrl 会把新鲜 URL 存到 p.url，
+// 翻页时 showAt 直接命中缓存，无需再等换 URL 接口；new Image() 预热浏览器 HTTP 缓存
+function prefetchViewerNeighbors(idx) {
+  const n = currentPhotos.length;
+  if (n < 2) return;
+  for (const d of [-1, 1, 2]) {
+    const q = currentPhotos[(idx + d + n) % n];
+    if (!q || q.kind !== 'image') continue;
+    (q.url ? Promise.resolve(q.url) : freshPhotoUrl(q))
+      .then((u) => { if (u) { const im = new Image(); im.src = u; } })
+      .catch(() => {});
   }
 }
 
@@ -1248,8 +1679,13 @@ function openViewer(i) {
     <div class="v-media" id="v-media"></div>
     ${currentPhotos.length > 1 ? '<button class="v-btn v-prev">‹</button><button class="v-btn v-next">›</button>' : ''}
     <div class="v-bar">
+      ${currentPhotos.length > 1 ? '<button class="v-btn" data-a="slideshow">▶ 幻灯片</button>' : ''}
       ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn" data-a="cover">📌 设为封面</button>' : ''}
       ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn" data-a="share-one">分享这张</button>' : ''}
+      ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn" data-a="retag">🔄 重打标签</button>' : ''}
+      ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn v-del" data-a="delete">🗑 删除</button>' : ''}
+      ${canEditAlbum() && !viewerCrossAlbum ? '<button class="v-btn" data-a="fav"></button>' : ''}
+      ${canEditAlbum() && !viewerCrossAlbum ? '<button class="v-btn" data-a="caption">✏️ 备注</button>' : ''}
       ${shareMode || p.kind === 'video' || viewerCrossAlbum ? '' : `
       <button class="v-btn" data-a="idphoto">制作证件照</button>
       <button class="v-btn" data-a="style">换风格</button>
@@ -1263,33 +1699,175 @@ function openViewer(i) {
   const mediaBox = el.querySelector('#v-media');
 
   // 显示指定位置媒体：图片用 <img>，视频用 <video> 原生播放；先换新鲜 URL
+  let activeHls = null;
   const showAt = async (idx) => {
     const q = currentPhotos[idx];
+    if (activeHls) { try { activeHls.destroy(); } catch { /* ignore */ } activeHls = null; }
     el.querySelector('.v-name').textContent = `${q.filename} · ${fmtSize(q.size)}`;
     el.querySelector('#v-info').innerHTML = viewerInfoHtml(q);
     mediaBox.innerHTML = '';
     if (q.kind === 'video') {
+      const wrap = document.createElement('div');
+      wrap.className = 'v-video-wrap';
       const video = document.createElement('video');
       video.controls = true;
       video.playsInline = true;
       video.preload = 'metadata';
       video.className = 'v-video loading';
-      video.addEventListener('loadeddata', () => video.classList.remove('loading'));
-      video.addEventListener('error', () => video.classList.remove('loading'));
-      video.src = q.url || await freshPhotoUrl(q);
-      mediaBox.appendChild(video);
+      if (q.thumbUrl) video.poster = q.thumbUrl;
+
+      // 播放失败遮罩：区分 HEVC 不支持 / 网络或链接问题，均提供下载与重试
+      const fail = document.createElement('div');
+      fail.className = 'v-videofail';
+      fail.style.display = 'none';
+      fail.innerHTML = `
+        <div class="v-videofail-title">⚠️ 视频无法播放</div>
+        <div class="v-videofail-msg"></div>
+        <div class="v-videofail-actions">
+          <a class="btn" target="_blank" rel="noopener">⬇️ 下载原片观看</a>
+          <button class="btn" type="button">🔄 重试（刷新链接）</button>
+        </div>`;
+      const failMsg = fail.querySelector('.v-videofail-msg');
+      const failDl = fail.querySelector('a');
+      const failRetry = fail.querySelector('button');
+      const showFail = (hevcSuspect) => {
+        video.classList.remove('loading');
+        video.style.visibility = 'hidden';
+        fail.style.display = 'flex';
+        failMsg.textContent = hevcSuspect
+          ? '该视频很可能采用 H.265/HEVC 编码（iPhone 默认格式），当前浏览器无法解码。可下载到本地后用系统播放器观看。'
+          : '视频加载失败，可能是网络问题或播放链接已过期（链接 15 分钟有效）。可重试或下载原片。';
+      };
+      video.addEventListener('loadeddata', () => { video.classList.remove('loading'); video.style.visibility = ''; });
+      video.addEventListener('error', () => {
+        // 仅在媒体源出错时弹遮罩（poster 加载失败不会设置 video.error）
+        if (!video.error || !video.currentSrc) return;
+        const hevcSuspect = video.error.code === 4 /* MEDIA_ERR_SRC_NOT_SUPPORTED */
+          && !hevcPlayable()
+          && /\.(mov|mp4|m4v)(\?|$)/i.test(video.currentSrc + ' ' + q.filename);
+        showFail(hevcSuspect);
+      });
+
+      const rawUrl = q.url || await freshPhotoUrl(q);
+      // 视频优先 H.264 代理（跨浏览器可播，解决 iPhone H.265/HEVC 黑屏）；无代理回退原片
+      const src = (q.kind === 'video' && q.proxyUrl) ? q.proxyUrl : rawUrl;
+      failDl.href = rawUrl;
+      failDl.setAttribute('download', q.filename || 'video');
+      failRetry.addEventListener('click', async () => {
+        try {
+          fail.style.display = 'none';
+          video.style.visibility = '';
+          video.classList.add('loading');
+          delete q.url; delete q.proxyUrl;
+          const fresh = await freshPhotoUrl(q);
+          failDl.href = fresh;
+          if (activeHls) { try { activeHls.destroy(); } catch { /* ignore */ } activeHls = null; }
+          video.src = q.proxyUrl || fresh;
+          video.load();
+        } catch { showFail(false); }
+      });
+
+      // HLS 源（.m3u8）用 hls.js 播放，其余原生播放
+      if (/\.m3u8(\?|$)/i.test(src)) {
+        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = src; // Safari 原生支持 HLS
+        } else {
+          try {
+            const hls = await loadHlsJs();
+            activeHls = hls;
+            hls.loadSource(src);
+            hls.attachMedia(video);
+          } catch { video.src = src; }
+        }
+      } else {
+        video.src = src;
+      }
+
+      // .mov / QuickTime 且本机不支持 HEVC：先给非阻断提示（已有 H.264 代理则无需提示）
+      const isQuickTime = (q.contentType || '').includes('quicktime')
+        || /\.mov$/i.test(q.filename || '');
+      if (isQuickTime && !hevcPlayable() && !q.proxyUrl) {
+        const hint = document.createElement('div');
+        hint.className = 'v-videohint';
+        hint.innerHTML = `iPhone 视频（H.265/HEVC）可能无法在此浏览器播放，若黑屏请 <a target="_blank" rel="noopener">下载原片</a> 观看`;
+        hint.querySelector('a').href = src;
+        hint.querySelector('a').setAttribute('download', q.filename || 'video.mov');
+        wrap.appendChild(hint);
+      }
+
+      wrap.appendChild(video);
+      wrap.appendChild(fail);
+      mediaBox.appendChild(wrap);
     } else {
+      // 大图加载期间用 ThumbHash 模糊占位铺底，加载完成后撤掉
+      mediaBox.style.backgroundImage = '';
+      mediaBox.style.minWidth = '';
+      mediaBox.style.minHeight = '';
+      if (q.thumbHash && window.ThumbHash) {
+        try {
+          const phUrl = window.ThumbHash.thumbHashToDataURL(thumbHashToBytes(q.thumbHash));
+          mediaBox.style.backgroundImage = `url("${phUrl}")`;
+          mediaBox.style.backgroundRepeat = 'no-repeat';
+          mediaBox.style.backgroundPosition = 'center';
+          mediaBox.style.backgroundSize = 'contain';
+          // img 元数据到达前容器可能塌缩为 0，占位期间给个最小可视区
+          mediaBox.style.minWidth = 'min(60vw, 480px)';
+          mediaBox.style.minHeight = '40vh';
+        } catch { /* 占位失败不影响原图 */ }
+      }
       const img = document.createElement('img');
       img.className = 'loading';
       img.alt = '';
-      img.addEventListener('load', () => img.classList.remove('loading'));
-      img.addEventListener('error', () => img.classList.remove('loading'));
+      img.fetchPriority = 'high';
+      const clearPh = () => {
+        mediaBox.style.backgroundImage = '';
+        mediaBox.style.minWidth = '';
+        mediaBox.style.minHeight = '';
+      };
+      img.addEventListener('load', () => { img.classList.remove('loading'); clearPh(); });
+      img.addEventListener('error', () => { img.classList.remove('loading'); clearPh(); });
       img.src = q.url || await freshPhotoUrl(q);
       mediaBox.appendChild(img);
+      prefetchViewerNeighbors(idx);
     }
+    syncFavBtn();
   };
 
-  const close = () => { document.removeEventListener('keydown', onKey); el.remove(); };
+  // 同步网格中的收藏角标（时间线/搜索结果两处 DOM 都更新）
+  const syncFavBadge = (q) => {
+    document.querySelectorAll(`.photo-item[data-photo-id="${q.id}"]`).forEach((item) => {
+      const exists = item.querySelector('.fav-badge');
+      if (q.isFavorite && !exists) {
+        const badge = document.createElement('span');
+        badge.className = 'fav-badge';
+        badge.title = '已收藏';
+        badge.textContent = '★';
+        item.appendChild(badge);
+      } else if (!q.isFavorite && exists) {
+        exists.remove();
+      }
+    });
+  };
+
+  let slideTimer = null;
+  const stopSlideshow = () => {
+    if (slideTimer) { clearInterval(slideTimer); slideTimer = null; }
+    const btn = el.querySelector('[data-a="slideshow"]');
+    if (btn) btn.textContent = '▶ 幻灯片';
+  };
+  const startSlideshow = () => {
+    stopSlideshow();
+    const btn = el.querySelector('[data-a="slideshow"]');
+    if (btn) btn.textContent = '⏸ 暂停';
+    slideTimer = setInterval(() => nav(1), 3500);
+  };
+  const toggleSlideshow = () => { slideTimer ? stopSlideshow() : startSlideshow(); };
+
+  const close = () => {
+    stopSlideshow();
+    if (activeHls) { try { activeHls.destroy(); } catch { /* ignore */ } activeHls = null; }
+    document.removeEventListener('keydown', onKey); el.remove();
+  };
   const nav = (d) => {
     viewerIdx = (viewerIdx + d + currentPhotos.length) % currentPhotos.length;
     showAt(viewerIdx);
@@ -1298,6 +1876,7 @@ function openViewer(i) {
     if (e.key === 'Escape') close();
     if (e.key === 'ArrowLeft') nav(-1);
     if (e.key === 'ArrowRight') nav(1);
+    if (e.key === ' ') { e.preventDefault(); toggleSlideshow(); }
   };
   document.addEventListener('keydown', onKey);
   el.addEventListener('click', (e) => { if (e.target === el) close(); });
@@ -1305,6 +1884,7 @@ function openViewer(i) {
   el.querySelector('[data-a="close"]').addEventListener('click', close);
   el.querySelector('.v-prev')?.addEventListener('click', () => nav(-1));
   el.querySelector('.v-next')?.addEventListener('click', () => nav(1));
+  el.querySelector('[data-a="slideshow"]')?.addEventListener('click', toggleSlideshow);
   el.querySelector('[data-a="cover"]')?.addEventListener('click', async (e) => {
     const q = currentPhotos[viewerIdx];
     const btn = e.target;
@@ -1320,6 +1900,40 @@ function openViewer(i) {
     const q = currentPhotos[viewerIdx];
     close();
     showShareModal(currentAlbumId, q.id);
+  });
+  el.querySelector('[data-a="retag"]')?.addEventListener('click', async (e) => {
+    const q = currentPhotos[viewerIdx];
+    const btn = e.target;
+    btn.disabled = true;
+    btn.textContent = '重打中…';
+    try {
+      const r = await api('POST', '/admin/backfill-tags', { photoId: q.id }, q.albumId || currentAlbumId);
+      if (r.done && r.tags) {
+        q.tags = r.tags;
+        el.querySelector('#v-info').innerHTML = viewerInfoHtml(q);
+        toast(`已重打（今日额度剩 ${r.quotaLeft}）`);
+      } else if (r.quotaExhausted || !r.quotaLeft) {
+        toast('今日 AI 额度已用完，明天再试', true);
+      } else {
+        toast('重打失败，旧标签已保留（额度已退还）' + (r.reason ? '：' + r.reason : ''), true);
+      }
+    } catch (err) { toast(err.message, true); }
+    btn.disabled = false;
+    btn.textContent = '🔄 重打标签';
+  });
+  el.querySelector('[data-a="delete"]')?.addEventListener('click', async () => {
+    const q = currentPhotos[viewerIdx];
+    if (!await confirmModal('删除照片', `「${q.filename}」将移入回收站，10 天内可还原。`, '移入回收站', true)) return;
+    try {
+      await api('DELETE', `/photos/${q.id}`);
+      document.querySelector(`.photo-item[data-photo-id="${q.id}"]`)?.remove();
+      currentPhotos = currentPhotos.filter((x) => x.id !== q.id);
+      selectedIds?.delete?.(q.id);
+      toast('已移入回收站');
+      if (!currentPhotos.length) { close(); render(); return; }
+      if (viewerIdx >= currentPhotos.length) viewerIdx = currentPhotos.length - 1;
+      nav(0); // 重新渲染当前位置（nav 会取模并刷新信息栏）
+    } catch (err) { toast(err.message, true); }
   });
   el.querySelector('[data-a="idphoto"]')?.addEventListener('click', () => {
     const pid = currentPhotos[viewerIdx].id;
@@ -1351,6 +1965,43 @@ function openViewer(i) {
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
     } catch { if (url) window.open(url, '_blank'); }
+  });
+
+  // 收藏切换（管理员或相册解锁游客；写入后同步按钮文案与网格角标）
+  const favBtn = el.querySelector('[data-a="fav"]');
+  function syncFavBtn() {
+    if (!favBtn) return;
+    favBtn.textContent = currentPhotos[viewerIdx]?.isFavorite ? '⭐ 已收藏' : '☆ 收藏';
+  }
+  favBtn?.addEventListener('click', async () => {
+    const q = currentPhotos[viewerIdx];
+    favBtn.disabled = true;
+    try {
+      const r = await api('POST', `/photos/${q.id}/favorite`,
+        { value: !q.isFavorite }, q.albumId || currentAlbumId);
+      q.isFavorite = r.isFavorite;
+      syncFavBtn();
+      syncFavBadge(q);
+      toast(q.isFavorite ? '已加入收藏' : '已取消收藏');
+    } catch (err) { toast(err.message, true); }
+    favBtn.disabled = false;
+  });
+
+  // 照片备注（≤500 字，保存后即时刷新信息区）
+  el.querySelector('[data-a="caption"]')?.addEventListener('click', () => {
+    const q = currentPhotos[viewerIdx];
+    promptModal('照片备注',
+      `<div class="field"><label>给这张照片写一句故事</label>
+       <textarea id="f-caption" rows="4" maxlength="500"
+         placeholder="例如：这是爷爷 80 岁生日那天">${esc(q.caption || '')}</textarea></div>`,
+      async (m) => {
+        const caption = m.querySelector('#f-caption').value.trim();
+        const r = await api('PATCH', `/photos/${q.id}`,
+          { caption }, q.albumId || currentAlbumId);
+        q.caption = r.caption;
+        el.querySelector('#v-info').innerHTML = viewerInfoHtml(q);
+        toast('备注已保存');
+      }, '保存');
   });
 
   showAt(i);
@@ -1451,7 +2102,7 @@ async function renderTrash() {
     const item = document.createElement('div');
     item.className = 'photo-item trash-item';
     item.innerHTML = `
-      <img src="${esc(p.thumbUrl)}" loading="lazy" alt="${esc(p.filename)}">
+      <img src="${esc(p.thumbUrl)}" loading="lazy" decoding="async" alt="${esc(p.filename)}">
       <div class="trash-meta">
         <div class="trash-name" title="${esc(p.filename)}">${esc(p.filename)}</div>
         <div class="trash-sub">
@@ -1512,6 +2163,41 @@ const SHARE_KIND_META = {
   photo:   { icon: '🖼', label: '单张' },
   collect: { icon: '📥', label: '求照片' },
 };
+
+// ---------- 分享二维码（qrcode-generator 按需加载，约 20KB） ----------
+
+let qrLoading = null;
+function loadQrCode() {
+  if (window.qrcode) return Promise.resolve();
+  if (!qrLoading) {
+    qrLoading = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'vendor/qrcode/qrcode.min.js';
+      s.onload = () => (window.qrcode ? resolve() : reject(new Error('二维码组件初始化失败')));
+      s.onerror = () => reject(new Error('二维码组件加载失败'));
+      document.head.appendChild(s);
+    });
+  }
+  return qrLoading;
+}
+
+async function showQrModal(url, label = '分享链接') {
+  try {
+    await loadQrCode();
+  } catch (err) { toast(err.message, true); return; }
+  const qr = qrcode(0, 'M');
+  qr.addData(url);
+  qr.make();
+  const m = openModal(`
+    <h2>扫码打开 · ${esc(label)}</h2>
+    <div class="qr-box">${qr.createSvgTag(6, 2)}</div>
+    <div class="share-url qr-url">${esc(url)}</div>
+    <p class="f-hint">用微信或手机相机扫码即可打开；求照片链接可投屏到现场屏幕，宾客扫码即传</p>
+    <div class="actions">
+      <button class="btn primary" data-r="ok">关闭</button>
+    </div>`);
+  m.querySelector('[data-r="ok"]').addEventListener('click', closeModal);
+}
 
 async function showShareModal(albumId, initialPhotoId = null) {
   const m = openModal(`
@@ -1595,8 +2281,10 @@ async function showShareModal(albumId, initialPhotoId = null) {
         <div class="share-url" title="${esc(s.url)}">${esc(s.url)}</div>
         <div class="share-exp">${esc(String(s.expiresAt).slice(0, 10))} 到期</div>
       </div>
+      <button class="btn small" data-op="qr">📱 二维码</button>
       <button class="btn small" data-op="copy">复制</button>
       <button class="btn small danger" data-op="revoke">撤销</button>`;
+    row.querySelector('[data-op="qr"]').addEventListener('click', () => showQrModal(s.url, meta.label));
     row.querySelector('[data-op="copy"]').addEventListener('click', async (e) => {
       await copyText(s.url);
       e.target.textContent = '已复制';
@@ -1735,8 +2423,11 @@ async function bootShare(data) {
       <h1>${esc(data.album.name)}
         <span class="lock" style="vertical-align:3px">${data.kind === 'photo' ? '分享照片' : '分享链接'}</span>
       </h1>
+      ${data.kind === 'album' && list.photos.length
+        ? '<div class="page-actions"><button class="btn" id="btn-fav-only">⭐ 只看收藏</button></div>' : ''}
     </div>
     ${data.album.description ? `<p style="color:var(--muted);font-size:14px;margin-bottom:14px">${esc(data.album.description)}</p>` : ''}
+    ${data.kind === 'album' ? albumSearchHtml() : ''}
     ${list.photos.length ? `
       <div id="photo-area"></div>
       <div id="page-sentinel" class="page-sentinel"></div>
@@ -1746,8 +2437,12 @@ async function bootShare(data) {
   if (list.photos.length) {
     currentPhotos.push(...list.photos);
     buildPhotoArea();
-    addPhotoItems(list.photos, false); // 只读：无删除按钮
+    addPhotoItems(list.photos, false, 8); // 只读：无删除按钮
     if (pageState.hasMore) setupInfiniteLoad();
+  }
+  if (data.kind === 'album') {
+    bindAlbumSearch(data.album.id);
+    bindFavOnlyBtn(data.album.id);
   }
 }
 
@@ -1807,8 +2502,246 @@ async function renderOnThisDay() {
 
   const grid = document.getElementById('photo-grid');
   if (grid) {
-    for (const p of data.photos) grid.appendChild(createPhotoItem(p, isAdmin()));
+    data.photos.forEach((p, i) => grid.appendChild(createPhotoItem(p, isAdmin(), i < 8)));
   }
+}
+
+// 动态加载 hls.js（仅播放 .m3u8 时按需加载）
+let _hlsPromise = null;
+function loadHlsJs() {
+  if (_hlsPromise) return _hlsPromise.then((Hls) => new Hls());
+  _hlsPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://unpkg.com/hls.js@1.5.13/dist/hls.min.js';
+    s.onload = () => (window.Hls ? resolve(window.Hls) : reject(new Error('hls.js 加载失败')));
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return _hlsPromise.then((Hls) => new Hls());
+}
+
+// 探测当前浏览器是否能硬解 HEVC/H.265（iPhone 默认视频编码）
+let _hevc = null;
+function hevcPlayable() {
+  if (_hevc !== null) return _hevc;
+  const v = document.createElement('video');
+  _hevc = ['hvc1.1.6.L93.B0', 'hvc1.2.4.L153.B0', 'hev1.1.6.L93.B0']
+    .some((c) => {
+      const r = v.canPlayType(`video/mp4; codecs="${c}"`);
+      return r === 'probably' || r === 'maybe';
+    });
+  return _hevc;
+}
+
+// ==================== 视图：智能相册（旅行/事件聚类） ====================
+
+// 事件列表：按拍摄时间自动聚类（后端 12 小时间隔切分）
+async function renderSmart() {
+  $view.innerHTML = `<div class="empty">加载中…</div>`;
+  let data;
+  try {
+    data = await api('GET', '/smart/events');
+  } catch (err) {
+    $view.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  const events = data.events || [];
+  $view.innerHTML = `
+    <div class="page-head">
+      <h1>✨ 智能相册</h1>
+      <div class="page-actions"><a class="btn" href="#/albums">← 返回相册</a></div>
+    </div>
+    <p class="collect-sub">按拍摄时间自动聚类的「旅行 / 事件」：相邻照片间隔超过 12 小时即分段</p>
+    ${events.length
+      ? `<div class="album-grid" id="smart-grid"></div>`
+      : `<div class="empty">暂无可聚类的事件（需同一时间段内至少 2 张照片）</div>`}`;
+
+  const grid = document.getElementById('smart-grid');
+  if (!grid) return;
+  for (const e of events) {
+    const card = document.createElement('div');
+    card.className = 'album-card';
+    const coverHtml = e.thumbUrl
+      ? `${e.thumbAvifUrl
+          ? `<picture><source type="image/avif" srcset="${esc(e.thumbAvifUrl)}">`
+          : ''}<img class="album-cover" src="${esc(e.thumbUrl)}" loading="lazy" decoding="async" alt="">${e.thumbAvifUrl ? '</picture>' : ''}`
+      : `<div class="album-cover placeholder">📷</div>`;
+    const startDay = fmtDateHeader(e.start.slice(0, 10));
+    const endDay = e.end.slice(0, 10);
+    const range = endDay !== e.start.slice(0, 10)
+      ? `${startDay} 至 ${fmtDateHeader(endDay)}` : startDay;
+    card.innerHTML = `
+      <div class="album-cover-wrap">${coverHtml}</div>
+      <div class="album-info">
+        <h3>${esc(range)}</h3>
+        <div class="meta">${e.count} 张照片${e.centerLat ? ' · 📍 含地点' : ''}</div>
+      </div>`;
+    card.addEventListener('click', () => {
+      location.hash = `#/smart?start=${encodeURIComponent(e.start)}&end=${encodeURIComponent(e.end)}`;
+    });
+    grid.appendChild(card);
+  }
+}
+
+// 事件内照片网格（复用 createPhotoItem / 查看器，跨相册只读）
+async function renderSmartPhotos(start, end, albumId) {
+  viewerCrossAlbum = true;
+  $view.innerHTML = `<div class="empty">加载中…</div>`;
+  let data;
+  try {
+    data = await api('GET', `/smart/photos?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&albumId=${encodeURIComponent(albumId)}`);
+  } catch (err) {
+    $view.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  const photos = data.photos || [];
+  $view.innerHTML = `
+    <div class="page-head">
+      <h1>✨ 事件照片</h1>
+      <div class="page-actions"><a class="btn" href="#/smart">← 智能相册</a></div>
+    </div>
+    <div id="photo-area"><div class="photo-grid" id="photo-grid"></div></div>`;
+  currentPhotos = photos;
+  const grid = document.getElementById('photo-grid');
+  if (grid) photos.forEach((p, i) => grid.appendChild(createPhotoItem(p, isAdmin(), i < 8)));
+}
+
+// ==================== 视图：地图 ====================
+let _mapLoaded = false;
+function loadLeaflet() {
+  if (window.L) return Promise.resolve();
+  if (_mapLoaded) return _mapLoaded;
+  _mapLoaded = new Promise((resolve, reject) => {
+    const css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    document.head.appendChild(css);
+    const js = document.createElement('script');
+    js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    js.onload = () => resolve();
+    js.onerror = reject;
+    document.head.appendChild(js);
+  });
+  return _mapLoaded;
+}
+
+async function renderMap() {
+  $view.innerHTML = `
+    <div class="page-head">
+      <h1>🗺️ 地图</h1>
+      <div class="page-actions"><a class="btn" href="#/albums">← 返回</a></div>
+    </div>
+    <div id="map" style="height: calc(100vh - 140px); min-height: 400px; border-radius: 12px; z-index: 0;"></div>`;
+  currentAlbumId = null;
+  let data;
+  try {
+    data = await api('GET', '/photos/geo');
+  } catch (err) {
+    $view.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  const photos = data.photos || [];
+  currentPhotos = photos;
+  viewerCrossAlbum = true;
+
+  if (!photos.length) {
+    $view.innerHTML += `<div class="empty" style="margin-top:1rem">没有带 GPS 坐标的照片</div>`;
+    return;
+  }
+  try {
+    await loadLeaflet();
+  } catch {
+    $view.innerHTML = `<div class="empty">地图库加载失败，请检查网络</div>`;
+    return;
+  }
+
+  const map = L.map('map');
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap',
+    maxZoom: 19,
+  }).addTo(map);
+
+  const bounds = [];
+  photos.forEach((p, i) => {
+    const marker = L.marker([p.lat, p.lng]).addTo(map);
+    bounds.push([p.lat, p.lng]);
+    const thumb = p.thumbUrl
+      ? `<img src="${esc(p.thumbUrl)}" style="width:120px;height:120px;object-fit:cover;border-radius:6px;cursor:pointer" data-idx="${i}">`
+      : '';
+    marker.bindPopup(`
+      <div style="text-align:center;min-width:130px">
+        ${thumb}
+        <div style="margin-top:6px;font-size:12px;color:#555">${esc(p.albumName || '')}</div>
+        ${p.takenAt ? `<div style="font-size:11px;color:#888">${esc(p.takenAt.slice(0, 10))}</div>` : ''}
+      </div>`);
+    marker.on('popupopen', () => {
+      const img = marker.getPopup().getElement()?.querySelector('img');
+      if (img) img.onclick = () => openViewer(parseInt(img.dataset.idx, 10));
+    });
+  });
+  if (bounds.length) map.fitBounds(bounds, { padding: [40, 40] });
+}
+
+// ==================== 视图：重复照片检测（管理员） ====================
+async function renderDuplicates() {
+  if (!isAdmin()) {
+    $view.innerHTML = `<div class="empty">需要管理员登录</div>`;
+    return;
+  }
+  $view.innerHTML = `
+    <div class="page-head">
+      <h1>🔁 重复照片</h1>
+      <div class="page-actions"><a class="btn" href="#/albums">← 返回</a></div>
+    </div>
+    <div class="empty">分析中…（仅检查已上传并带有 dHash 的照片）</div>`;
+  currentAlbumId = null;
+  let data;
+  try {
+    data = await api('GET', '/duplicates');
+  } catch (err) {
+    $view.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  const groups = data.groups || [];
+  if (!groups.length) {
+    $view.innerHTML = `
+      <div class="page-head">
+        <h1>🔁 重复照片</h1>
+        <div class="page-actions"><a class="btn" href="#/albums">← 返回</a></div>
+      </div>
+      <div class="empty">没有发现相似照片 ✨</div>`;
+    return;
+  }
+  // 收集所有照片供查看器使用
+  const all = groups.flat();
+  currentPhotos = all;
+  viewerCrossAlbum = true;
+
+  let html = `
+    <div class="page-head">
+      <h1>🔁 重复照片</h1>
+      <div class="page-actions"><a class="btn" href="#/albums">← 返回</a></div>
+    </div>
+    <p class="collect-sub">共 ${groups.length} 组相似照片（dHash 汉明距离 < 8）</p>`;
+  groups.forEach((g, gi) => {
+    html += `<div style="margin: 1rem 0; padding: 1rem; background: var(--bg-soft, #f5f5f5); border-radius: 12px;">
+      <div style="font-weight: 600; margin-bottom: 0.5rem;">第 ${gi + 1} 组 · ${g.length} 张</div>
+      <div class="photo-grid" style="grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));">`;
+    g.forEach((p) => {
+      const idx = all.indexOf(p);
+      html += `
+        <div class="photo-item" data-idx="${idx}" style="cursor:pointer">
+          ${p.thumbUrl ? `<img src="${esc(p.thumbUrl)}" loading="lazy" decoding="async">` : '<div class="ph-empty">无缩略图</div>'}
+          <div class="ph-name" title="${esc(p.filename)}">${esc(p.filename)}</div>
+          <div class="ph-sub">${esc(p.albumName || '')}</div>
+        </div>`;
+    });
+    html += `</div></div>`;
+  });
+  $view.innerHTML = html;
+  $view.querySelectorAll('.photo-item').forEach((el) => {
+    el.onclick = () => openViewer(parseInt(el.dataset.idx, 10));
+  });
 }
 
 // ==================== 视图：用量统计（管理员） ====================
@@ -1829,6 +2762,25 @@ async function renderStats() {
   currentAlbumId = null;
   currentPhotos = [];
   const t = data.totals;
+  const q = data.quota;
+  const pct = q.usagePercent;
+  const barClass = pct >= 90 ? 'danger' : pct >= 70 ? 'warn' : '';
+
+  // D1 免费额度：读 500 万行/天、写 10 万行/天（UTC 自然日重置）；每月为当月累计，无月度上限
+  const d1 = data.d1;
+  const fmtNum = (n) => (n >= 10000 ? (n / 10000).toFixed(1).replace(/\.0$/, '') + ' 万' : String(n));
+  const d1Bar = (label, used, limit) => {
+    const p = Math.min(100, Math.round((used / limit) * 100));
+    const cls = p >= 90 ? 'danger' : p >= 70 ? 'warn' : '';
+    return `
+      <div class="quota-bar-row">
+        <div class="quota-bar-label">${label} <span class="quota-bar-nums">${fmtNum(used)} / ${fmtNum(limit)}</span></div>
+        <div class="quota-bar-wrap">
+          <div class="quota-bar"><div class="quota-bar-fill ${cls}" style="width:${p}%"></div></div>
+          <div class="quota-bar-text">${p}%</div>
+        </div>
+      </div>`;
+  };
 
   const statCard = (label, value, sub = '') => `
     <div class="stat-card">
@@ -1842,6 +2794,38 @@ async function renderStats() {
       <h1>📊 用量统计</h1>
       <div class="page-actions"><a class="btn" href="#/albums">← 返回</a></div>
     </div>
+
+    <div class="quota-card">
+      <div class="quota-info">
+        <div class="quota-title">R2 存储空间 <span class="quota-tag">免费 10 GB</span></div>
+        <div class="quota-desc">
+          已用 <b>${esc(fmtSize(q.usedBytes))}</b> · 剩余 <b>${esc(fmtSize(q.remainBytes))}</b> · 占用 ${pct}%
+        </div>
+      </div>
+      <div class="quota-bar-wrap">
+        <div class="quota-bar">
+          <div class="quota-bar-fill ${barClass}" style="width:${pct}%"></div>
+        </div>
+        <div class="quota-bar-text">${pct}%</div>
+      </div>
+      <a class="btn btn-upgrade" href="https://dash.cloudflare.com/?to=/:account/r2/plans" target="_blank" rel="noopener">⚡ 立即扩容</a>
+    </div>
+
+    <div class="quota-card">
+      <div class="quota-info">
+        <div class="quota-title">D1 数据库 <span class="quota-tag">免费版·按天重置</span></div>
+        <div class="quota-desc">
+          本月累计 读 <b>${fmtNum(d1.monthRead)}</b> 行 · 写 <b>${fmtNum(d1.monthWritten)}</b> 行
+          <br>自统计口径（部署后起计），与官方账单可能略有出入
+        </div>
+      </div>
+      <div class="quota-bars">
+        ${d1Bar('今日读行数（UTC ' + esc(d1.date) + '）', d1.todayRead, d1.readLimit)}
+        ${d1Bar('今日写行数', d1.todayWritten, d1.writeLimit)}
+      </div>
+      <a class="btn btn-upgrade" href="https://dash.cloudflare.com/?to=/:account/workers/plans" target="_blank" rel="noopener">⚡ 立即扩容</a>
+    </div>
+
     <div class="stat-cards">
       ${statCard('照片总数', t.photos, `其中视频 ${t.videos} 个`)}
       ${statCard('存储用量', fmtSize(t.bytes), 'R2 实际占用（含缩略图）')}
@@ -1862,7 +2846,49 @@ async function renderStats() {
             <td class="num">${fmtSize(r.bytes)}</td>
           </tr>`).join('')}
       </tbody>
-    </table>`;
+    </table>
+
+    <div class="quota-card">
+      <div class="quota-info">
+        <div class="quota-title">🔍 语义检索索引 <span class="quota-tag">bge-m3 中文模型</span></div>
+        <div class="quota-desc">
+          升级模型后需重建一次：用新视觉模型补生成「画面描述句」，并按 bge-m3 重算全部照片向量。
+          全局覆盖式重打，每批 20 张，受每日 AI 额度限制，可跨天继续。
+        </div>
+        <div id="rebuild-tip" class="quota-desc" style="margin-top:8px"></div>
+      </div>
+      <button class="btn btn-upgrade" id="btn-rebuild-emb">🔄 重建语义索引</button>
+    </div>`;
+
+  document.getElementById('btn-rebuild-emb')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const tip = document.getElementById('rebuild-tip');
+    const ok = await confirmModal(
+      '重建语义索引',
+      '将用新模型覆盖全部已有标签并补生成画面描述句、重算 bge-m3 向量；每张消耗今日 AI 额度（每天最多 200 张，可分多天完成）。未打标签的照片不受影响。确定继续？',
+      '开始重建', true
+    );
+    if (!ok) return;
+    btn.disabled = true;
+    const since = new Date().toISOString();
+    let batches = 0, done = 0, failed = 0, total = 0;
+    try {
+      for (;;) {
+        const r = await api('POST', '/admin/backfill-tags', { limit: 20, mode: 'retag', since });
+        batches++;
+        done += r.done; failed += r.failed || 0;
+        total = Math.max(total, done + failed + r.remaining);
+        renderAiProgress(tip, { action: '本批重算', total, done, failed, remaining: r.remaining, quotaLeft: r.quotaLeft, failReasons: r.failReasons });
+        if (r.quotaExhausted) { toast('今日 AI 额度已用尽，明天可继续重建'); break; }
+        if (r.remaining <= 0) { toast('语义索引重建完成'); break; }
+        if (batches >= 10) { toast('已连续重算 200 张，今天先到这，明天可继续'); break; }
+      }
+    } catch (err) {
+      toast('重建中断：' + err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
 
 // ==================== 打包下载（JSZip CDN，UMD 全局 JSZip） ====================
@@ -1870,10 +2896,12 @@ async function renderStats() {
 // 打包当前已加载照片为 zip：并发 3 抓取原图（URL 15 分钟有效，随用随换）
 async function zipDownload(albumName, btn) {
   if (typeof JSZip !== 'function') { toast('打包组件未加载（CDN），请稍后再试', true); return; }
-  const photos = filteredPhotos();
+  const photos = currentPhotos;
   if (!photos.length) { toast('没有可下载的照片', true); return; }
+  const scope = searchState.favoriteOnly ? '收藏的'
+    : searchState.active ? '搜索结果中的' : '已加载的';
   if (!await confirmModal('打包下载',
-    `将把当前${searchTerm.trim() ? '搜索范围内的' : '已加载的'} ${photos.length} 张照片打包为 zip。`, '开始打包')) return;
+    `将把当前${scope} ${photos.length} 张照片打包为 zip${searchState.active ? '' : '（向下滚动可加载更多）'}。`, '开始打包')) return;
   btn.disabled = true;
   const tip = document.getElementById('backfill-tip');
   tip.style.display = '';
@@ -1937,7 +2965,8 @@ function initDragDrop() {
     e.preventDefault();
     if (!can) return;
     const files = [...(e.dataTransfer?.files ?? [])]
-      .filter((f) => f.type.startsWith('image/') || f.type.startsWith('video/'));
+      .filter((f) => f.type.startsWith('image/') || f.type.startsWith('video/')
+        || /\.(heic|heif)$/i.test(f.name));
     if (files.length) uploadFiles(currentAlbumId, files);
   });
 }
@@ -1945,6 +2974,7 @@ function initDragDrop() {
 // ==================== 路由 ====================
 
 async function render() {
+  disconnectRecycleObserver(); // 离开照片网格类页面：释放观察器对旧节点的引用
   // 清理可能残留的多选 UI（批量成功后 finishBatch 已清，这里兜底）
   if (selectMode) {
     selectMode = false;
@@ -1976,6 +3006,23 @@ async function render() {
   }
   if (hash.startsWith('#/on-this-day')) {
     renderOnThisDay();
+    return;
+  }
+  if (hash.startsWith('#/map')) {
+    renderMap();
+    return;
+  }
+  if (hash.startsWith('#/smart')) {
+    const qp = new URLSearchParams(hash.slice(hash.indexOf('?') + 1));
+    if (qp.get('start') && qp.get('end')) {
+      renderSmartPhotos(qp.get('start'), qp.get('end'), qp.get('albumId') || '');
+    } else {
+      renderSmart();
+    }
+    return;
+  }
+  if (hash.startsWith('#/duplicates')) {
+    renderDuplicates();
     return;
   }
   if (hash.startsWith('#/stats')) {

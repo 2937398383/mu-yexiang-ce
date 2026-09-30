@@ -18,6 +18,58 @@ async function extractFrame(env, r2Object, width) {
   };
 }
 
+// 把一个视频转码为 H.264/AAC 代理 MP4（mode:'video' 输出 H.264，解决 iPhone H.265/HEVC 浏览器黑屏）
+// 输入限制与抽帧一致：<100MB、<10 分钟；超出则不生成代理（原样播放 + HEVC 兜底提示）
+async function transcodeProxy(env, r2Object, width = 1920) {
+  if (!env.MEDIA) throw new Error('MEDIA binding missing');
+  const result = env.MEDIA.input(r2Object.body)
+    .transform({ width, fit: 'scale-down' })
+    .output({ mode: 'video', audio: true });
+  return {
+    stream: await result.media(),
+    contentType: await result.contentType(),
+  };
+}
+
+// 给单个视频生成 H.264 代理（用于跨浏览器播放）；photo 需含 id、object_key
+// 已存在代理则跳过；成功后写回 proxy_key 并递增相册版本
+export async function ensureVideoProxy(env, photo) {
+  try {
+    if (!photo.object_key) return { ok: false, reason: 'no-key' };
+    const head = await env.R2.head(photo.object_key);
+    if (!head) return { ok: false, reason: 'missing' };
+    if (head.size > MAX_VIDEO_BYTES) return { ok: false, reason: 'too_large' };
+
+    const dot = photo.object_key.lastIndexOf('.');
+    const base = photo.object_key.slice(0, dot); // albums/<albumId>/<uuid>
+    const proxyKey = base + '.proxy.mp4';
+
+    // 已生成过则跳过（避免重复计费/重复转码）
+    const existing = await env.R2.head(proxyKey).catch(() => null);
+    if (existing) return { ok: true, skipped: true };
+
+    const obj = await env.R2.get(photo.object_key);
+    const { stream, contentType } = await transcodeProxy(env, obj, 1920);
+    await env.R2.put(proxyKey, stream, {
+      httpMetadata: { contentType: contentType || 'video/mp4', cacheControl: 'public, max-age=31536000, immutable' },
+    });
+    await env.DB.prepare('UPDATE photo SET proxy_key = ? WHERE id = ?')
+      .bind(proxyKey, photo.id).run();
+    // 代理生成 → 相册列表 ETag 失效
+    try {
+      const aid = (await env.DB.prepare('SELECT album_id FROM photo WHERE id = ?').bind(photo.id).first())?.album_id;
+      if (aid) await env.DB.prepare(
+        `INSERT INTO album_version(album_id, v) VALUES(?, 1)
+         ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
+      ).bind(aid).run();
+    } catch { /* ignore */ }
+    return { ok: true };
+  } catch (e) {
+    console.log('ensureVideoProxy failed:', photo.id, e?.message ?? String(e));
+    return { ok: false, reason: 'error' };
+  }
+}
+
 // 给单个视频补封面帧；photo 需含 id、object_key
 export async function ensureVideoPoster(env, photo) {
   try {
@@ -34,7 +86,7 @@ export async function ensureVideoPoster(env, photo) {
     const objSmall = await env.R2.get(photo.object_key);
     const small = await extractFrame(env, objSmall, 640);
     await env.R2.put(smallKey, small.stream, {
-      httpMetadata: { contentType: small.contentType || 'image/jpeg' },
+      httpMetadata: { contentType: small.contentType || 'image/jpeg', cacheControl: 'public, max-age=31536000, immutable' },
     });
 
     // 大图（查看器用）；失败时仅登记小图
@@ -47,6 +99,14 @@ export async function ensureVideoPoster(env, photo) {
       await env.DB.prepare(
         'UPDATE photo SET thumb_key = ?, large_key = ? WHERE id = ?'
       ).bind(smallKey, largeKey, photo.id).run();
+      // 封面帧生成 → 相册列表 ETag 失效
+      try {
+        const aid = (await env.DB.prepare('SELECT album_id FROM photo WHERE id = ?').bind(photo.id).first())?.album_id;
+        if (aid) await env.DB.prepare(
+          `INSERT INTO album_version(album_id, v) VALUES(?, 1)
+           ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
+        ).bind(aid).run();
+      } catch { /* ignore */ }
     } catch (e) {
       await env.DB.prepare(
         'UPDATE photo SET thumb_key = ? WHERE id = ?'

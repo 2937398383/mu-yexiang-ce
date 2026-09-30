@@ -5,3 +5,35 @@
   Strict-Transport-Security: max-age=15552000; includeSubDomains
   Permissions-Policy: geolocation=(self), camera=(), microphone=(), browsing-topics=()
   X-Permitted-Cross-Domain-Policies: none
+
+# ---- 内容寻址的 AI 模型资源（文件名带内容 hash），永久缓存 ----
+/vendor/imgly/*
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/ort/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# ---- 图标与 pinned 第三方库：版本固定，长缓存 ----
+/icons/*
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/exifr/*
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/heic2any/*
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/qrcode/*
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/thumbhash/*
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/browser-image-compression.js
+  Cache-Control: public, max-age=31536000, immutable
+/vendor/jszip.min.js
+  Cache-Control: public, max-age=31536000, immutable
+
+# ---- 应用脚本/样式/清单：短缓存 + 协商校验（SW 负责版本更替，避免部署后滞留旧版） ----
+/app.js
+  Cache-Control: public, max-age=3600
+/style.css
+  Cache-Control: public, max-age=3600
+/config.js
+  Cache-Control: public, max-age=3600
+/manifest.webmanifest
+  Cache-Control: public, max-age=3600

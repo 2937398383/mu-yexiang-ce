@@ -9,6 +9,8 @@
   <link rel="icon" type="image/png" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/icon-192.png">
   <link rel="stylesheet" href="style.css">
+  <link rel="dns-prefetch" href="https://album-photos.65e1870ebd61513b5e09664b1673a5ed.r2.cloudflarestorage.com">
+  <link rel="preconnect" href="https://album-photos.65e1870ebd61513b5e09664b1673a5ed.r2.cloudflarestorage.com">
   <!-- @imgly/background-removal 内部动态 import 裸包名，需用 importmap 指向自托管副本 -->
   <script type="importmap">
   {
@@ -34,19 +36,16 @@
   <div id="modal-root"></div>
   <div id="toast-root"></div>
 
-  <script src="config.js"></script>
-  <script src="vendor/exifr/lite.umd.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/browser-image-compression@2.0.2/dist/browser-image-compression.js"
-    integrity="sha384-dHP9fwqd9BAiDh9uJ0p10khgbbcFMh34bVEiCnJ1Ah/AT2T2k4t572VEo3WXzxXp"
-    crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"
-    integrity="sha384-+mbV2IY1Zk/X1p/nWllGySJSUN8uMs+gUAN10Or95UBH0fpj6GfKgPmgC5EXieXG"
-    crossorigin="anonymous"></script>
-  <script src="upload-util.js"></script>
-  <script src="idphoto.js"></script>
-  <script src="style-transfer.js"></script>
-  <script src="bg-replace.js"></script>
-  <script src="app.js"></script>
+  <script src="config.js" defer></script>
+  <script src="vendor/exifr/lite.umd.js" defer></script>
+  <script src="vendor/browser-image-compression.js" defer></script>
+  <script src="vendor/jszip.min.js" defer></script>
+  <script src="vendor/thumbhash/thumbhash.js" defer></script>
+  <script src="upload-util.js" defer></script>
+  <script src="idphoto.js" defer></script>
+  <script src="style-transfer.js" defer></script>
+  <script src="bg-replace.js" defer></script>
+  <script src="app.js" defer></script>
   <script>
     // PWA：注册 Service Worker（排除 localhost 与 Pages 预览子域，避免调试/验证时缓存干扰）
     (function () {
