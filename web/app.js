@@ -277,7 +277,15 @@ async function api(method, path, body, albumIdForUnlock) {
   } catch {
     throw { status: 0, message: '网络错误：请检查 config.js 里的 Worker 地址' };
   }
-  const data = await resp.json().catch(() => ({}));
+  let data = await resp.json().catch(() => ({}));
+  // 服务冷启动迁移中的 503：等一小会儿自动重试一次（Worker 并发迁移失败会很快自愈）
+  if (resp.status === 503 && data.retryable) {
+    await new Promise((r) => setTimeout(r, 900));
+    resp = await fetch(window.API_BASE + path, {
+      method, headers, body: body != null ? JSON.stringify(body) : undefined,
+    });
+    data = await resp.json().catch(() => ({}));
+  }
   if (!resp.ok || data.ok === false) {
     // 错误对象附带完整响应体（如还原接口 409 时的可选相册列表）
     throw { status: resp.status, message: data.error || '请求失败(' + resp.status + ')', data };

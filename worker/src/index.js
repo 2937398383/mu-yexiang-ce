@@ -137,22 +137,33 @@ function canAccessAlbum(auth, album) {
 let photoSchemaEnsured = false;
 let schemaMigration = null; // 迁移互斥锁：并发冷启动请求共享同一次迁移，避免重复 ALTER 冲突
 
+const SCHEMA_RETRY = 3;        // 迁移失败重试次数（D1 并发冷启动偶发锁竞争 / 超时）
+const SCHEMA_RETRY_DELAY = 250; // 重试基础退避（毫秒）
+
 async function ensurePhotoSchema(env) {
-  if (photoSchemaEnsured) return;
+  if (photoSchemaEnsured) return true;
   // 复用进行中的迁移：手机端 PWA 首屏会并发触发导航 + 多个 API 请求，
   // 若各自独立跑迁移会同时执行非幂等的 ALTER TABLE 导致 D1 "duplicate column" 报错 → 500
   if (!schemaMigration) {
-    schemaMigration = runSchemaMigration(env)
-      .then(() => { photoSchemaEnsured = true; })
-      .catch((e) => {
-        // 迁移失败不向外抛：listAlbums 等不依赖新列的接口仍可正常服务；
-        // 依赖新列的接口（listPhotos）会暂时报错，等下次请求重试补齐后自动恢复
-        console.error('[schema] migration failed, will retry on next request:', e?.message ?? e);
-      })
-      .finally(() => { schemaMigration = null; });
+    schemaMigration = (async () => {
+      for (let attempt = 1; attempt <= SCHEMA_RETRY; attempt++) {
+        try {
+          await runSchemaMigration(env);
+          photoSchemaEnsured = true;
+          return true;
+        } catch (e) {
+          // 迁移全部语句均幂等（addCol 容错 duplicate column、CREATE IF NOT EXISTS、
+          // 回填 UPDATE 仅补 NULL），可安全重跑。D1 冷启动并发下偶发 "database is locked"/
+          // 超时，重试即可补齐。若始终失败，返回 false 让路由层回 503，而不是让依赖新列的
+          // 接口（listPhotos）抛 "no such column" 变成 500「服务器开小差」。
+          console.error(`[schema] migration attempt ${attempt}/${SCHEMA_RETRY} failed:`, e?.message ?? e);
+          if (attempt < SCHEMA_RETRY) await delay(SCHEMA_RETRY_DELAY * attempt);
+        }
+      }
+      return false;
+    })().finally(() => { schemaMigration = null; });
   }
-  // 无论迁移成败都吞掉异常，避免单个请求拖垮整个 route（尤其是不依赖新列的接口）
-  try { await schemaMigration; } catch { /* 已在上方 catch 处理 */ }
+  return await schemaMigration;
 }
 
 async function runSchemaMigration(env) {
@@ -385,7 +396,6 @@ async function runSchemaMigration(env) {
       v        INTEGER NOT NULL DEFAULT 0
     )`
   ).run();
-  photoSchemaEnsured = true;
 }
 
 // 递增相册版本号（照片增删改、封面变更等都调用）
@@ -740,7 +750,8 @@ async function listPhotos(request, env, albumId) {
   const extraParams = [];
   if (missingOnly) extraSql.push('thumb_key IS NULL');
   // 单张分享：只能看到被分享的那一张（忽略分页游标）
-  const singleShareId = auth.role === 'share' && auth.photoId ? auth.photoId : null;
+  // 注意：匿名访客 auth 为 null，必须短路判断，否则访问 auth.role 抛 TypeError → 500
+  const singleShareId = auth && auth.role === 'share' && auth.photoId ? auth.photoId : null;
   if (singleShareId) {
     extraSql.push('id = ?');
     extraParams.push(singleShareId);
@@ -2010,7 +2021,12 @@ async function route(request, env, ctx) {
   if (missing.length) return fail('服务未配置完成，缺少: ' + missing.join(', '), 503);
 
   // 迁移先行（isolate 内只执行一次），随后进行应用层边缘检查
-  await ensurePhotoSchema(env);
+  const schemaReady = await ensurePhotoSchema(env);
+  if (!schemaReady) {
+    // 迁移反复失败（如 D1 异常）：返回 503 让客户端稍后重试，
+    // 避免依赖新列（enc_key/enc_meta 等）的 listPhotos 抛 "no such column" → 500「服务器开小差」
+    return json({ ok: false, error: '服务正在初始化，请稍后重试', retryable: true }, 503);
+  }
   const edgeHit = await edgeGuard(request, env);
   if (edgeHit) return edgeHit;
 
