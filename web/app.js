@@ -117,6 +117,30 @@ function renderAuthArea() {
   document.getElementById('btn-logout')?.addEventListener('click', logout);
 }
 
+// ==================== Turnstile（人机验证，防密码爆破） ====================
+
+// 在弹窗打开后手动渲染 widget（render=explicit）
+function renderTurnstileInto(containerId) {
+  const el = document.getElementById(containerId);
+  if (window.turnstile && el && !el.dataset.rendered) {
+    window.turnstile.render('#' + containerId, {
+      sitekey: window.TURNSTILE_SITE_KEY,
+      theme: 'auto',
+    });
+    el.dataset.rendered = '1';
+  }
+}
+
+// 提交时取 token，未通过则拦截
+function turnstileToken(containerId) {
+  const el = document.getElementById(containerId);
+  if (window.turnstile && el) {
+    const t = window.turnstile.getResponse(el);
+    if (t) return t;
+  }
+  throw { status: 400, message: '请先完成人机验证' };
+}
+
 // ==================== 加密相册（端到端，明文只在浏览器） ====================
 
 const ENC_ALBUM_KEY_PREFIX = 'albumkey_';
@@ -149,8 +173,9 @@ function hasEncAlbumKey(albumId) {
 }
 
 // 解锁加密相册：服务端只返回被 KEK 包裹的相册主密钥 + 派生参数，口令校验在本地完成
-async function encUnlockAndStore(albumId, password) {
-  const r = await api('POST', `/albums/${albumId}/unlock`, {}, albumId);
+async function encUnlockAndStore(albumId, password, ttoken) {
+  const body = ttoken ? { turnstileToken: ttoken } : {};
+  const r = await api('POST', `/albums/${albumId}/unlock`, body, albumId);
   if (!r.encrypted) throw { message: '该相册不是加密相册' };
   const salt = enc_b64urlDecode(r.kekSalt);
   const kek = await enc_deriveKEK(password, salt, r.kekIters);
@@ -375,14 +400,17 @@ function showLoginModal() {
     <div class="field">
       <label>管理密码</label>
       <input id="f-pw" type="password" autocomplete="current-password">
-    </div>`, async (m) => {
+    </div>
+    <div id="turnstile-login"></div>`, async (m) => {
     const pw = m.querySelector('#f-pw').value;
-    const r = await api('POST', '/login', { password: pw });
+    const ttoken = turnstileToken('turnstile-login');
+    const r = await api('POST', '/login', { password: pw, turnstileToken: ttoken });
     saveToken(localStorage, ADMIN_KEY, r.token, r.expiresIn);
     renderAuthArea(); render();
     toast('已登录');
   }, '登录');
   m.querySelector('#f-pw').focus();
+  renderTurnstileInto('turnstile-login');
 }
 
 function showUnlockModal(albumId, albumName, isEnc = false) {
@@ -395,20 +423,23 @@ function showUnlockModal(albumId, albumName, isEnc = false) {
     : `<div class="field">
          <input class="pw" id="f-pw" type="tel" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="off">
        </div>`;
-  const m = promptModal(`输入「${albumName}」的${isEnc ? '口令' : '密码'}`, fieldHtml, async (m) => {
+  const m = promptModal(`输入「${albumName}」的${isEnc ? '口令' : '密码'}`, fieldHtml + `
+    <div id="turnstile-unlock"></div>`, async (m) => {
     const pw = m.querySelector('#f-pw').value;
+    const ttoken = turnstileToken('turnstile-unlock');
     if (isEnc) {
       if (!pw) throw { message: '请输入口令' };
-      await encUnlockAndStore(albumId, pw);
+      await encUnlockAndStore(albumId, pw, ttoken);
     } else {
       if (!/^\d{6}$/.test(pw)) throw { message: '请输入6位数字密码' };
-      const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw });
+      const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw, turnstileToken: ttoken });
       saveToken(sessionStorage, 'unlock_' + albumId, r.token, r.expiresIn);
     }
     location.hash = '#/album/' + albumId;
     render();
   }, '解锁');
   m.querySelector('#f-pw').focus();
+  renderTurnstileInto('turnstile-unlock');
 }
 
 // 工具页（证件照 / 换风格）使用的相册解锁：弹密码框，成功后只存 token 并 resolve(true)，不跳转；取消返回 false
@@ -419,10 +450,12 @@ function promptAlbumPassword(albumId, albumName) {
     const m = promptModal(`输入「${albumName}」的密码`, `
       <div class="field">
         <input class="pw" id="f-pw" type="tel" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="off">
-      </div>`, async (mm) => {
+      </div>
+      <div id="turnstile-unlock"></div>`, async (mm) => {
       const pw = mm.querySelector('#f-pw').value;
       if (!/^\d{6}$/.test(pw)) throw { message: '请输入6位数字密码' };
-      const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw });
+      const ttoken = turnstileToken('turnstile-unlock');
+      const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw, turnstileToken: ttoken });
       saveToken(sessionStorage, 'unlock_' + albumId, r.token, r.expiresIn);
       finish(true);
     }, '解锁');
@@ -431,6 +464,7 @@ function promptAlbumPassword(albumId, albumName) {
       if (e.target === e.currentTarget) finish(false);
     });
     m.querySelector('#f-pw').focus();
+    renderTurnstileInto('turnstile-unlock');
   });
 }
 

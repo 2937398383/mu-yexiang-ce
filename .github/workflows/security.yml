@@ -1,0 +1,66 @@
+# 安全扫描（免费：GitHub Actions 公有仓库零成本）
+# 三个 Job：
+#   secret-scan  gitleaks      防密钥误提交
+#   dep-scan     osv-scanner   依赖已知漏洞（扫 worker/package-lock.json）
+#   nuclei-scan  nuclei        线上站点 CVE/配置/暴露面扫描（只扫前端 Pages，避开 Worker 的 UA 拦截）
+name: Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 4 * * 0'   # 每周日 04:00 UTC
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  secret-scan:
+    name: gitleaks 密钥扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dep-scan:
+    name: osv-scanner 依赖漏洞扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run osv-scanner
+        uses: google/osv-scanner-action@v1
+
+  nuclei-scan:
+    name: nuclei 线上站点扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nuclei
+        run: |
+          wget -q https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_Linux_amd64.zip
+          unzip -q nuclei_Linux_amd64.zip
+          chmod +x nuclei
+      - name: Update templates
+        run: ./nuclei -update-templates -silent
+      - name: Run nuclei（仅前端静态站）
+        continue-on-error: true
+        run: |
+          ./nuclei -u https://album-web.pages.dev \
+            -tags cves,misconfig,exposure \
+            -severity low,medium,high,critical \
+            -silent -o nuclei-report.txt
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-report
+          path: nuclei-report.txt
+          retention-days: 14

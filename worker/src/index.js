@@ -16,6 +16,7 @@ import { tagPhotoOnUpload, backfillTags, EMBED_MODEL, EMBED_VERSION, SEMANTIC_TH
 import { buildTagGroups, ensureTagEmbTable } from './tag-groups.js';
 import { backfillVideoPosters, ensureVideoProxy } from './video-thumb.js';
 import { edgeGuard } from './edge-guard.js';
+import { verifyTurnstile } from './turnstile.js';
 import { createUsageMeter, flushUsage } from './usage-meter.js';
 
 // ---------- 常量 ----------
@@ -422,6 +423,8 @@ async function handleLogin(request, env) {
   // 静默锁定期：不暴露锁定状态，伪装成普通密码错误
   if (await checkLock(env, 'admin', request)) return fail('密码错误', 401);
   const body = await readJson(request);
+  const vt = await verifyTurnstile(env, body.turnstileToken, request.headers.get('CF-Connecting-IP'));
+  if (!vt.ok) return fail(vt.error, vt.status);
   if (!body.password || body.password !== env.ADMIN_PASSWORD) {
     const r = await recordFailure(env, 'admin', request);
     await delay(500); // 拖慢密码爆破
@@ -443,6 +446,9 @@ async function handleUnlock(request, env, albumId) {
   // 解包成功与否由客户端用口令判断（口令错则 PBKDF2→AES 解包失败）。安全靠口令强度 + PBKDF2 迭代成本。
   if (album.encrypted) {
     if (await checkLock(env, `album:${albumId}`, request)) return fail('尝试过于频繁，请稍后再试', 429);
+    const encBody = await readJson(request);
+    const vtEnc = await verifyTurnstile(env, encBody.turnstileToken, request.headers.get('CF-Connecting-IP'));
+    if (!vtEnc.ok) return fail(vtEnc.error, vtEnc.status);
     const token = await signJwt({ role: 'album', albumId }, env.JWT_SECRET, ALBUM_TOKEN_TTL);
     return json({
       ok: true, token, encrypted: true,
@@ -458,6 +464,8 @@ async function handleUnlock(request, env, albumId) {
   if (await checkLock(env, scope, request)) return fail('相册密码错误', 401);
 
   const body = await readJson(request);
+  const vt = await verifyTurnstile(env, body.turnstileToken, request.headers.get('CF-Connecting-IP'));
+  if (!vt.ok) return fail(vt.error, vt.status);
   const hash = await hashPassword(String(body.password ?? ''));
   if (hash !== album.password_hash) {
     const r = await recordFailure(env, scope, request);
