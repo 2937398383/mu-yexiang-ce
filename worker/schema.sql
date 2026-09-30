@@ -9,6 +9,10 @@ CREATE TABLE IF NOT EXISTS album (
   description    TEXT NOT NULL DEFAULT '',             -- 相册描述
   password_hash  TEXT,                                 -- 6位数字密码哈希，NULL = 公开相册
   cover_photo_id TEXT,                                 -- 相册封面照片 ID
+  encrypted      INTEGER NOT NULL DEFAULT 0,           -- 加密相册标记：0 | 1
+  enc_key        TEXT,                                 -- KEK 包裹的相册主密钥（JSON {wrapped,iv}）
+  kek_salt       TEXT,                                 -- PBKDF2 盐（base64）
+  kek_iters      INTEGER,                              -- PBKDF2 迭代次数
   created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -24,6 +28,8 @@ CREATE TABLE IF NOT EXISTS photo (
   large_avif_key TEXT,                                 -- AVIF 中图键（预留）
   proxy_key    TEXT,                                   -- 视频 H.264 代理键：<uuid>.proxy.mp4（跨浏览器播放）
   exif         TEXT,                                   -- 全量 EXIF 曝光参数（JSON：快门/光圈/ISO/焦距/镜头）
+  enc_key      TEXT,                                   -- 加密相册：albumKey 加密的 fileKey（JSON {enc,iv}）
+  enc_meta     TEXT,                                   -- 加密相册：fileKey 加密的元数据（base64：nonceBase||GCM(meta)）
   content_type TEXT,
   size         INTEGER,
   status       TEXT NOT NULL DEFAULT 'uploading',      -- uploading | ready | trashed

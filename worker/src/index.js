@@ -124,19 +124,52 @@ function isAdmin(auth) {
 }
 
 // 访问相册的条件：管理员 / 相册公开 / 持有该相册的解锁 token / 持有该相册的分享 token
+// 加密相册（encrypted=1）不可公开访问：内容为密文，需解锁后（role=album）才能取回包裹密钥与密文
 function canAccessAlbum(auth, album) {
   if (isAdmin(auth)) return true;
   if (auth && auth.role === 'share' && auth.albumId === album.id) return true;
-  if (!album.password_hash) return true;
+  if (!album.password_hash && !album.encrypted) return true;
   return !!auth && auth.role === 'album' && auth.albumId === album.id;
 }
 
 // ---------- 表结构迁移（幂等，每个 isolate 只跑一次） ----------
 
 let photoSchemaEnsured = false;
+let schemaMigration = null; // 迁移互斥锁：并发冷启动请求共享同一次迁移，避免重复 ALTER 冲突
 
 async function ensurePhotoSchema(env) {
   if (photoSchemaEnsured) return;
+  // 复用进行中的迁移：手机端 PWA 首屏会并发触发导航 + 多个 API 请求，
+  // 若各自独立跑迁移会同时执行非幂等的 ALTER TABLE 导致 D1 "duplicate column" 报错 → 500
+  if (!schemaMigration) {
+    schemaMigration = runSchemaMigration(env)
+      .then(() => { photoSchemaEnsured = true; })
+      .catch((e) => {
+        // 迁移失败不向外抛：listAlbums 等不依赖新列的接口仍可正常服务；
+        // 依赖新列的接口（listPhotos）会暂时报错，等下次请求重试补齐后自动恢复
+        console.error('[schema] migration failed, will retry on next request:', e?.message ?? e);
+      })
+      .finally(() => { schemaMigration = null; });
+  }
+  // 无论迁移成败都吞掉异常，避免单个请求拖垮整个 route（尤其是不依赖新列的接口）
+  try { await schemaMigration; } catch { /* 已在上方 catch 处理 */ }
+}
+
+async function runSchemaMigration(env) {
+  // ALTER 容错：跨 isolate 并发冷启动（不同边缘节点同时迁移）可能撞到重复列，忽略 duplicate column 错误
+  const addCol = async (table, col, type) => {
+    try {
+      await env.DB.prepare(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`).run();
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e?.message ?? e))) throw e;
+    }
+  };
+  // 索引创建容错：索引只是查询优化，失败（如表达式索引在旧数据上建不了）不应中断
+  // 后续的 addCol，否则会漏加列 → 依赖新列的接口（listPhotos）报 no such column
+  const safeExec = async (label, sql) => {
+    try { await env.DB.prepare(sql).run(); }
+    catch (e) { console.error(`[schema] ${label} failed (non-fatal):`, e?.message ?? e); }
+  };
   const newColumns = {
     thumb_key: 'TEXT', large_key: 'TEXT',
     thumb_avif_key: 'TEXT', large_avif_key: 'TEXT',
@@ -152,27 +185,39 @@ async function ensurePhotoSchema(env) {
     caption: 'TEXT',                            // 照片故事备注（≤500 字）
     tagged_at: 'TEXT',                          // 最近一次 AI 打标成功时间（重打活动游标）
     thumb_hash: 'TEXT',                         // ThumbHash 模糊占位（base64，~25 字节）
+    enc_key: 'TEXT',                            // 加密相册：albumKey 加密的 fileKey（JSON {enc,iv}）
+    enc_meta: 'TEXT',                           // 加密相册：fileKey 加密的元数据（base64：nonceBase||GCM(meta)）
   };
   const { results: cols } = await env.DB.prepare('PRAGMA table_info(photo)').all();
   const existing = new Set(cols.map((c) => c.name));
   for (const [name, type] of Object.entries(newColumns)) {
     if (!existing.has(name)) {
-      await env.DB.prepare(`ALTER TABLE photo ADD COLUMN ${name} ${type}`).run();
+      await addCol('photo', name, type);
     }
   }
   // kind 带默认值，需单独处理
   if (!existing.has('kind')) {
-    await env.DB.prepare("ALTER TABLE photo ADD COLUMN kind TEXT NOT NULL DEFAULT 'image'").run();
+    await addCol('photo', 'kind', "TEXT NOT NULL DEFAULT 'image'");
   }
   // album 表加自定义封面列
   const { results: albumCols } = await env.DB.prepare('PRAGMA table_info(album)').all();
   if (!albumCols.some((c) => c.name === 'cover_photo_id')) {
-    await env.DB.prepare('ALTER TABLE album ADD COLUMN cover_photo_id TEXT').run();
+    await addCol('album', 'cover_photo_id', 'TEXT');
   }
   if (!albumCols.some((c) => c.name === 'updated_at')) {
-    await env.DB.prepare(
-      `ALTER TABLE album ADD COLUMN updated_at TEXT`
-    ).run();
+    await addCol('album', 'updated_at', 'TEXT');
+  }
+  // 加密相册：密钥包裹与口令派生参数
+  const albumEncCols = [
+    ['encrypted', 'INTEGER NOT NULL DEFAULT 0'],
+    ['enc_key', 'TEXT'],
+    ['kek_salt', 'TEXT'],
+    ['kek_iters', 'INTEGER'],
+  ];
+  for (const [colName, colType] of albumEncCols) {
+    if (!albumCols.some((c) => c.name === colName)) {
+      await addCol('album', colName, colType);
+    }
   }
   // 登录/解锁失败计数表
   await env.DB.prepare(
@@ -186,13 +231,11 @@ async function ensurePhotoSchema(env) {
     )`
   ).run();
   // WHERE/ORDER BY 必须使用与此索引完全相同的表达式才能命中
-  await env.DB.prepare(
+  await safeExec('idx_photo_sort',
     `CREATE INDEX IF NOT EXISTS idx_photo_sort
-     ON photo (COALESCE(taken_at, created_at) DESC, id DESC)`
-  ).run();
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_photo_trashed ON photo(status, trashed_at)`
-  ).run();
+     ON photo (COALESCE(taken_at, created_at) DESC, id DESC)`);
+  await safeExec('idx_photo_trashed',
+    `CREATE INDEX IF NOT EXISTS idx_photo_trashed ON photo(status, trashed_at)`);
   // 相册分享链接（kind: album 整相册 | photo 单张 | collect 求照片上传收集）
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS share_link (
@@ -217,23 +260,19 @@ async function ensurePhotoSchema(env) {
   };
   for (const [name, type] of Object.entries(shareNewColumns)) {
     if (!shareExisting.has(name)) {
-      await env.DB.prepare(`ALTER TABLE share_link ADD COLUMN ${name} ${type}`).run();
+      await addCol('share_link', name, type);
     }
   }
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_share_album ON share_link(album_id)`
-  ).run();
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_share_photo ON share_link(photo_id)`
-  ).run();
+  await safeExec('idx_share_album',
+    `CREATE INDEX IF NOT EXISTS idx_share_album ON share_link(album_id)`);
+  await safeExec('idx_share_photo',
+    `CREATE INDEX IF NOT EXISTS idx_share_photo ON share_link(photo_id)`);
   // 上传体哈希（同相册去重）
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_photo_sha ON photo(album_id, sha256)`
-  ).run();
+  await safeExec('idx_photo_sha',
+    `CREATE INDEX IF NOT EXISTS idx_photo_sha ON photo(album_id, sha256)`);
   // 收藏筛选（部分索引，只索引已收藏照片）
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_photo_favorite ON photo(album_id) WHERE is_favorite = 1`
-  ).run();
+  await safeExec('idx_photo_favorite',
+    `CREATE INDEX IF NOT EXISTS idx_photo_favorite ON photo(album_id) WHERE is_favorite = 1`);
   // AI 打标每日全局限额（Workers AI 免费 10000 neurons/天）
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS ai_tag_daily (
@@ -286,33 +325,23 @@ async function ensurePhotoSchema(env) {
   ).run();
   // 照片最后修改时间（预留，未来可用于排序/展示；ETag 用 album_version 表）
   if (!existing.has('updated_at')) {
-    await env.DB.prepare(
-      `ALTER TABLE photo ADD COLUMN updated_at TEXT`
-    ).run();
+    await addCol('photo', 'updated_at', 'TEXT');
   }
   // 感知哈希（dHash 64-bit hex 字符串），用于重复照片检测
   if (!existing.has('phash')) {
-    await env.DB.prepare(
-      `ALTER TABLE photo ADD COLUMN phash TEXT`
-    ).run();
+    await addCol('photo', 'phash', 'TEXT');
   }
   // BGE 文本向量（标签+描述的 embedding，JSON 数组），用于语义搜索
   if (!existing.has('embedding')) {
-    await env.DB.prepare(
-      `ALTER TABLE photo ADD COLUMN embedding TEXT`
-    ).run();
+    await addCol('photo', 'embedding', 'TEXT');
   }
   // 向量模型版本：不同模型/维度的向量隔离，只与同版本查询向量比对
   if (!existing.has('emb_model')) {
-    await env.DB.prepare(
-      `ALTER TABLE photo ADD COLUMN emb_model TEXT`
-    ).run();
+    await addCol('photo', 'emb_model', 'TEXT');
   }
   // AI 生成的中文画面描述句（15~30 字），与标签共同构成语义索引文本
   if (!existing.has('ai_desc')) {
-    await env.DB.prepare(
-      `ALTER TABLE photo ADD COLUMN ai_desc TEXT`
-    ).run();
+    await addCol('photo', 'ai_desc', 'TEXT');
   }
   // 标签关联表：加速标签搜索（替代 LIKE 扫描 JSON 文本）
   await env.DB.prepare(
@@ -322,9 +351,8 @@ async function ensurePhotoSchema(env) {
       PRIMARY KEY (photo_id, tag)
     )`
   ).run();
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_photo_tag_tag ON photo_tag(tag)`
-  ).run();
+  await safeExec('idx_photo_tag_tag',
+    `CREATE INDEX IF NOT EXISTS idx_photo_tag_tag ON photo_tag(tag)`);
   // 回填：从现有 photo.tags JSON 同步到 photo_tag（仅补充缺失项，幂等）
   try {
     await env.DB.prepare(
@@ -336,18 +364,20 @@ async function ensurePhotoSchema(env) {
   } catch { /* 回填失败不影响启动 */ }
   // 拍摄月日（MM-DD）：往年今日查询可走索引，避免 strftime 全表扫
   if (!existing.has('taken_md')) {
-    await env.DB.prepare(
-      `ALTER TABLE photo ADD COLUMN taken_md TEXT`
-    ).run();
+    await addCol('photo', 'taken_md', 'TEXT');
   }
   // 幂等回填：无 EXIF 拍摄日期的照片按上传月日（与旧 strftime COALESCE 口径一致）
-  await env.DB.prepare(
-    `UPDATE photo SET taken_md = substr(COALESCE(taken_at, created_at), 6, 5)
-      WHERE taken_md IS NULL AND COALESCE(taken_at, created_at) IS NOT NULL`
-  ).run();
-  await env.DB.prepare(
-    `CREATE INDEX IF NOT EXISTS idx_photo_taken_md ON photo(taken_md, status)`
-  ).run();
+  // 大表 UPDATE 可能触发 D1 CPU 超时，失败不阻断启动（taken_md 仅用于往年今日索引优化）
+  try {
+    await env.DB.prepare(
+      `UPDATE photo SET taken_md = substr(COALESCE(taken_at, created_at), 6, 5)
+        WHERE taken_md IS NULL AND COALESCE(taken_at, created_at) IS NOT NULL`
+    ).run();
+  } catch (e) {
+    console.log('taken_md backfill failed (non-fatal):', e?.message ?? String(e));
+  }
+  await safeExec('idx_photo_taken_md',
+    `CREATE INDEX IF NOT EXISTS idx_photo_taken_md ON photo(taken_md, status)`);
   // 相册数据版本号（任何照片/相册变更自增，用于列表 ETag）
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS album_version (
@@ -394,9 +424,23 @@ async function handleLogin(request, env) {
 }
 
 async function handleUnlock(request, env, albumId) {
-  const album = await env.DB.prepare('SELECT id, password_hash FROM album WHERE id = ?')
-    .bind(albumId).first();
+  const album = await env.DB.prepare(
+    'SELECT id, password_hash, encrypted, enc_key, kek_salt, kek_iters FROM album WHERE id = ?'
+  ).bind(albumId).first();
   if (!album) return fail('相册不存在', 404);
+
+  // 加密相册：服务端无法验证口令（端到端）。返回被 KEK 包裹的相册主密钥与派生参数，
+  // 解包成功与否由客户端用口令判断（口令错则 PBKDF2→AES 解包失败）。安全靠口令强度 + PBKDF2 迭代成本。
+  if (album.encrypted) {
+    if (await checkLock(env, `album:${albumId}`, request)) return fail('尝试过于频繁，请稍后再试', 429);
+    const token = await signJwt({ role: 'album', albumId }, env.JWT_SECRET, ALBUM_TOKEN_TTL);
+    return json({
+      ok: true, token, encrypted: true,
+      encKey: album.enc_key, kekSalt: album.kek_salt, kekIters: album.kek_iters,
+      expiresIn: ALBUM_TOKEN_TTL,
+    });
+  }
+
   if (!album.password_hash) return json({ ok: true, token: null, note: '公开相册无需解锁' });
 
   const scope = `album:${albumId}`;
@@ -424,6 +468,7 @@ function albumView(row) {
     description: row.description,
     photoCount: row.photo_count ?? 0,
     locked: !!row.password_hash,
+    encrypted: !!row.encrypted,
     createdAt: row.created_at,
   };
 }
@@ -468,12 +513,12 @@ async function listAlbums(request, env) {
   const albums = [];
   for (const row of results) {
     const v = albumView(row);
-    // 加密相册对非管理员不签真实封面（列表无需解锁，防止内容泄露）
-    const showReal = admin || !row.password_hash;
+    // 加密/加锁相册对非管理员不签真实封面（列表无需解锁，防止内容泄露）
+    const showReal = admin || (!row.password_hash && !row.encrypted);
     v.coverUrl = showReal && row.cover_key
       ? await presignR2(env, 'GET', row.cover_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null;
     v.coverIsAuto = !row.cover_photo_id || row.cover_id !== row.cover_photo_id;
-    v.lockedCover = !!row.password_hash && !admin; // 前端显示锁形占位
+    v.lockedCover = (!!row.password_hash || !!row.encrypted) && !admin; // 前端显示锁形占位
     albums.push(v);
   }
   return json({
@@ -489,12 +534,38 @@ async function createAlbum(request, env) {
   if (!name || name.length > 100) return fail('相册名必填且不超过100字');
   const description = String(body.description ?? '').trim().slice(0, 500);
   const id = crypto.randomUUID();
+
+  // 加密相册：服务端只存「被 KEK 包裹的相册主密钥」与口令派生参数，永远拿不到明文密钥
+  let encrypted = 0, encKey = null, kekSalt = null, kekIters = null;
+  if (body.encrypted) {
+    const enc = parseJson(typeof body.encKey === 'string' ? body.encKey : null);
+    if (!enc || typeof enc.wrapped !== 'string' || typeof enc.iv !== 'string'
+      || !/^[A-Za-z0-9_-]{16,512}$/.test(enc.wrapped) || !/^[A-Za-z0-9_-]{8,64}$/.test(enc.iv)) {
+      return fail('加密相册缺少有效的包裹密钥');
+    }
+    if (typeof body.kekSalt !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(body.kekSalt)) {
+      return fail('加密相册缺少有效的派生盐');
+    }
+    const iters = Number(body.kekIters);
+    if (!Number.isSafeInteger(iters) || iters < 10000 || iters > 5000000) {
+      return fail('加密相册迭代次数非法');
+    }
+    encrypted = 1;
+    encKey = JSON.stringify(enc);
+    kekSalt = body.kekSalt;
+    kekIters = iters;
+  }
+
   const passwordHash = body.password != null
     ? (isSixDigits(body.password) ? await hashPassword(body.password) : null)
     : null;
   if (body.password != null && !isSixDigits(body.password)) return fail('密码必须是6位数字');
-  await env.DB.prepare('INSERT INTO album (id, name, description, password_hash) VALUES (?, ?, ?, ?)')
-    .bind(id, name, description, passwordHash).run();
+  if (encrypted && passwordHash) return fail('加密相册使用加密口令，无需再设置数字密码');
+
+  await env.DB.prepare(
+    `INSERT INTO album (id, name, description, password_hash, encrypted, enc_key, kek_salt, kek_iters)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, name, description, passwordHash, encrypted, encKey, kekSalt, kekIters).run();
   await bumpAlbumVersion(env, id);
   const row = await env.DB.prepare('SELECT *, 0 AS photo_count FROM album WHERE id = ?').bind(id).first();
   return json({ ok: true, album: albumView(row) }, 201);
@@ -622,7 +693,10 @@ async function listPhotos(request, env, albumId) {
   const album = await env.DB.prepare('SELECT * FROM album WHERE id = ?').bind(albumId).first();
   if (!album) return fail('相册不存在', 404);
   const auth = await getAuth(request, env);
-  if (!canAccessAlbum(auth, album)) return fail('需要相册密码', 403);
+  if (!canAccessAlbum(auth, album)) {
+    // 加密相册对未解锁访客也返回 403，但附带 encrypted 标记让前端弹「口令」框而非「数字密码」框
+    return json({ ok: false, error: '需要相册密码', encrypted: !!album.encrypted }, 403);
+  }
 
   const reqUrl = new URL(request.url);
   let limit = parseInt(reqUrl.searchParams.get('limit') ?? '60', 10);
@@ -659,6 +733,7 @@ async function listPhotos(request, env, albumId) {
     `SELECT id, filename, object_key, thumb_key, large_key, thumb_avif_key, large_avif_key, proxy_key,
             content_type, size, kind, duration,
             created_at, taken_at, camera, tags, ai_desc, is_favorite, caption, thumb_hash, exif,
+            enc_key, enc_meta,
             ${SORT_EXPR} AS sort_at`;
   // 动态附加条件（保持参数化）
   const extraSql = [];
@@ -696,23 +771,28 @@ async function listPhotos(request, env, albumId) {
   for (const r of page) {
     let tags = [];
     try { tags = r.tags ? JSON.parse(r.tags) : []; } catch { tags = []; }
+    // 加密相册：明文字段一律不下发（文件名/相机/标签/描述/备注/EXIF/缩略哈希），改下发密文元数据与包裹的文件密钥
+    const isEnc = !!album.encrypted;
     photos.push({
       id: r.id,
-      filename: r.filename,
+      filename: isEnc ? null : r.filename,
       size: r.size,
       contentType: r.content_type,
       kind: r.kind ?? 'image',
       duration: r.duration ?? null,
       createdAt: r.created_at,
       takenAt: r.taken_at,
-      camera: r.camera,
-      tags,
-      aiDesc: r.ai_desc ?? null,
+      camera: isEnc ? null : r.camera,
+      tags: isEnc ? [] : tags,
+      aiDesc: isEnc ? null : r.ai_desc,
       isFavorite: !!r.is_favorite,
-      caption: r.caption ?? '',
+      caption: isEnc ? null : r.caption,
       isThumb: !!r.thumb_key,
-      thumbHash: r.thumb_hash ?? null,
-      exif: parseJson(r.exif),
+      thumbHash: isEnc ? null : r.thumb_hash,
+      exif: isEnc ? null : parseJson(r.exif),
+      encrypted: isEnc,
+      encKey: isEnc ? r.enc_key : null,
+      encMeta: isEnc ? r.enc_meta : null,
       ...(await presignMedia(env, r)),
     });
   }
@@ -734,6 +814,7 @@ async function listPhotos(request, env, albumId) {
       id: album.id, name: album.name,
       description: album.description,
       locked: !!album.password_hash,
+      encrypted: !!album.encrypted,
       coverPhotoId: album.cover_photo_id ?? null,
     },
     photos,
@@ -746,7 +827,7 @@ async function listPhotos(request, env, albumId) {
 }
 
 async function createPhotoUpload(request, env, albumId, auth) {
-  const album = await env.DB.prepare('SELECT id FROM album WHERE id = ?').bind(albumId).first();
+  const album = await env.DB.prepare('SELECT id, encrypted FROM album WHERE id = ?').bind(albumId).first();
   if (!album) return fail('相册不存在', 404);
 
   // 求照片链接访客：每链接每 IP 每小时限 50 次
@@ -784,7 +865,7 @@ async function createPhotoUpload(request, env, albumId, auth) {
   if (typeof body.sha256 === 'string' && /^[0-9a-f]{64}$/.test(body.sha256)) {
     sha256 = body.sha256;
   }
-  if (sha256 && !body.forceSha) {
+  if (sha256 && !body.forceSha && !album.encrypted) {
     const dup = await env.DB.prepare(
       `SELECT id, filename FROM photo
         WHERE album_id = ? AND sha256 = ? AND status = 'ready' LIMIT 1`
@@ -839,6 +920,21 @@ async function createPhotoUpload(request, env, albumId, auth) {
     if (Object.keys(e).length) exifJson = JSON.stringify(e);
   }
 
+  // ---- 加密相册：接收 albumKey 加密的 fileKey 与 fileKey 加密的元数据 ----
+  let encKey = null, encMeta = null;
+  if (album.encrypted) {
+    const enc = parseJson(typeof body.encKey === 'string' ? body.encKey : null);
+    if (!enc || typeof enc.enc !== 'string' || typeof enc.iv !== 'string'
+      || !/^[A-Za-z0-9_-]{16,512}$/.test(enc.enc) || !/^[A-Za-z0-9_-]{8,64}$/.test(enc.iv)) {
+      return fail('加密相册缺少有效的文件密钥');
+    }
+    if (typeof body.encMeta !== 'string' || !/^[A-Za-z0-9_-]{16,8192}$/.test(body.encMeta)) {
+      return fail('加密相册缺少有效的加密元数据');
+    }
+    encKey = JSON.stringify(enc);
+    encMeta = body.encMeta;
+  }
+
   // ---- 缩略图 key ----
   // 图片：格式由前端实际编码结果决定（webp/jpg）；视频：前端抽帧固定 jpg
   const thumbFmt = isVideo ? 'jpg'
@@ -859,10 +955,14 @@ async function createPhotoUpload(request, env, albumId, auth) {
   await env.DB.prepare(
     `INSERT INTO photo
        (id, album_id, filename, object_key, content_type, status, kind, duration, sha256,
-        thumb_key, large_key, thumb_avif_key, large_avif_key, taken_at, camera, gps_lat, gps_lng, taken_md, exif)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(id, albumId, filename, objectKey, contentType, 'uploading', kind, duration, sha256,
-    smallKey, largeKey, avifSmallKey, avifLargeKey, takenAt, camera, gpsLat, gpsLng, takenMd, exifJson).run();
+        thumb_key, large_key, thumb_avif_key, large_avif_key, taken_at, camera, gps_lat, gps_lng, taken_md, exif,
+        enc_key, enc_meta)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, albumId, album.encrypted ? 'encrypted' : filename, objectKey, contentType, 'uploading', kind, duration, sha256,
+    smallKey, largeKey, avifSmallKey, avifLargeKey, takenAt,
+    album.encrypted ? null : camera, album.encrypted ? null : gpsLat, album.encrypted ? null : gpsLng,
+    takenMd, album.encrypted ? null : exifJson,
+    encKey, encMeta).run();
 
   const uploadUrl = await presignR2(env, 'PUT', objectKey, UPLOAD_URL_TTL);
   // 大视频分段上传：前端显式请求 multipart 时发起，控制面在此，数据面直传 R2
@@ -910,7 +1010,7 @@ function parseUploadMeta(request) {
 // 返回 { notFound | missing | ok(size) }，供直传 confirm 与分段 complete 复用
 async function finalizePhoto(env, photoId, ctx, { phash = null, thumbHash = null } = {}) {
   const photo = await env.DB.prepare(
-    "SELECT id, album_id, object_key, status, kind, thumb_key, large_key, thumb_avif_key, large_avif_key FROM photo WHERE id = ?"
+    "SELECT p.id, p.album_id, p.object_key, p.status, p.kind, p.thumb_key, p.large_key, p.thumb_avif_key, p.large_avif_key, a.encrypted FROM photo p JOIN album a ON a.id = p.album_id WHERE p.id = ?"
   ).bind(photoId).first();
   if (!photo) return { notFound: true };
   if (photo.status === 'ready') return { ready: true };
@@ -943,15 +1043,18 @@ async function finalizePhoto(env, photoId, ctx, { phash = null, thumbHash = null
      WHERE id = ?`
   ).bind(obj.size, obj.httpContentType ?? null, thumbKey, largeKey, thumbAvifKey, largeAvifKey,
     phash, thumbHash, photoId).run();
-  // 视频且前端未能抽帧：后台用 MEDIA 绑定 best-effort 补封面帧；并生成 H.264 代理
-  if (photo.kind === 'video') {
-    if (!thumbKey) {
-      ctx?.waitUntil(ensureVideoPoster(env, { id: photoId, object_key: photo.object_key }));
+  // 加密相册跳过全部服务端 AI（内容为密文，无法处理）：视频补帧/代理转码、AI 打标、语义 embedding
+  if (!photo.encrypted) {
+    // 视频且前端未能抽帧：后台用 MEDIA 绑定 best-effort 补封面帧；并生成 H.264 代理
+    if (photo.kind === 'video') {
+      if (!thumbKey) {
+        ctx?.waitUntil(ensureVideoPoster(env, { id: photoId, object_key: photo.object_key }));
+      }
+      ctx?.waitUntil(ensureVideoProxy(env, { id: photoId, object_key: photo.object_key }));
     }
-    ctx?.waitUntil(ensureVideoProxy(env, { id: photoId, object_key: photo.object_key }));
+    // 异步 AI 打标（额度内），不阻塞响应
+    ctx?.waitUntil(tagPhotoOnUpload(env, photoId));
   }
-  // 异步 AI 打标（额度内），不阻塞响应
-  ctx?.waitUntil(tagPhotoOnUpload(env, photoId));
   await bumpAlbumVersion(env, photo.album_id);
   return { ok: true, size: obj.size };
 }
@@ -1513,22 +1616,22 @@ function photoScope(auth, albumIdParam) {
   if (auth?.role === 'album') {
     if (albumIdParam) {
       return {
-        where: 'AND p.album_id = ? AND (a.password_hash IS NULL OR a.id = ?)',
+        where: 'AND p.album_id = ? AND ((a.password_hash IS NULL AND a.encrypted = 0) OR a.id = ?)',
         params: [albumIdParam, auth.albumId],
         singlePhotoId: null,
         denied: false,
       };
     }
     return {
-      where: 'AND (a.password_hash IS NULL OR a.id = ?)',
+      where: 'AND ((a.password_hash IS NULL AND a.encrypted = 0) OR a.id = ?)',
       params: [auth.albumId],
       singlePhotoId: null,
       denied: false,
     };
   }
-  // 匿名访客：必须指定相册，且该相册公开
+  // 匿名访客：必须指定相册，且该相册公开（未加密、无密码）
   return {
-    where: 'AND p.album_id = ? AND a.password_hash IS NULL',
+    where: 'AND p.album_id = ? AND a.password_hash IS NULL AND a.encrypted = 0',
     params: [albumIdParam],
     singlePhotoId: null,
     denied: !albumIdParam,

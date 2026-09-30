@@ -117,6 +117,143 @@ function renderAuthArea() {
   document.getElementById('btn-logout')?.addEventListener('click', logout);
 }
 
+// ==================== 加密相册（端到端，明文只在浏览器） ====================
+
+const ENC_ALBUM_KEY_PREFIX = 'albumkey_';
+const encAlbumKeyCache = new Map(); // albumId -> CryptoKey
+
+// 相册主密钥会话缓存：解锁/创建后以 raw base64 存 sessionStorage（与解锁 token 同生命周期）
+async function encGetAlbumKey(albumId) {
+  if (!albumId) return null;
+  if (encAlbumKeyCache.has(albumId)) return encAlbumKeyCache.get(albumId);
+  const b64 = sessionStorage.getItem(ENC_ALBUM_KEY_PREFIX + albumId);
+  if (!b64) return null;
+  try {
+    const key = await enc_importKey(enc_b64urlDecode(b64));
+    encAlbumKeyCache.set(albumId, key);
+    return key;
+  } catch {
+    sessionStorage.removeItem(ENC_ALBUM_KEY_PREFIX + albumId);
+    return null;
+  }
+}
+
+async function encSetAlbumKey(albumId, albumKey) {
+  const raw = new Uint8Array(await crypto.subtle.exportKey('raw', albumKey));
+  sessionStorage.setItem(ENC_ALBUM_KEY_PREFIX + albumId, enc_b64url(raw));
+  encAlbumKeyCache.set(albumId, albumKey);
+}
+
+function hasEncAlbumKey(albumId) {
+  return !!sessionStorage.getItem(ENC_ALBUM_KEY_PREFIX + albumId);
+}
+
+// 解锁加密相册：服务端只返回被 KEK 包裹的相册主密钥 + 派生参数，口令校验在本地完成
+async function encUnlockAndStore(albumId, password) {
+  const r = await api('POST', `/albums/${albumId}/unlock`, {}, albumId);
+  if (!r.encrypted) throw { message: '该相册不是加密相册' };
+  const salt = enc_b64urlDecode(r.kekSalt);
+  const kek = await enc_deriveKEK(password, salt, r.kekIters);
+  let albumKey;
+  try {
+    const wrapped = JSON.parse(r.encKey);
+    albumKey = await enc_unwrapAlbumKey(wrapped.wrapped, wrapped.iv, kek);
+  } catch {
+    throw { message: '口令错误，无法解锁' };
+  }
+  saveToken(sessionStorage, 'unlock_' + albumId, r.token, r.expiresIn);
+  await encSetAlbumKey(albumId, albumKey);
+}
+
+// 每张照片的文件密钥（albumKey 加密后存 D1）：解出并缓存 CryptoKey
+function encGetFileKeyCached(p, albumKey) {
+  if (!p._fileKey) {
+    p._fileKey = (async () => {
+      const enc = typeof p.encKey === 'string' ? JSON.parse(p.encKey) : p.encKey;
+      const bytes = await enc_decryptFileKey(enc.enc, enc.iv, albumKey);
+      return enc_importKey(bytes);
+    })();
+  }
+  return p._fileKey;
+}
+
+// 解密元数据（文件名/机型/GPS/EXIF/分块数等），缓存 { meta, nonceBase }
+function encGetMetaCached(p, fileKey) {
+  if (!p._meta) p._meta = enc_decryptMeta(fileKey, p.encMeta);
+  return p._meta;
+}
+
+// 把解密后的元数据合并进照片对象，供信息栏/网格显示
+async function encHydratePhoto(p, albumId) {
+  const albumKey = await encGetAlbumKey(albumId);
+  if (!albumKey) return p;
+  try {
+    const fileKey = await encGetFileKeyCached(p, albumKey);
+    const { meta } = await encGetMetaCached(p, fileKey);
+    if (meta.filename) p.filename = meta.filename;
+    if (meta.camera) p.camera = meta.camera;
+    if (meta.exif) p.exif = meta.exif;
+    p._encMeta = meta;
+  } catch { /* 元数据解密失败不影响密文主体 */ }
+  return p;
+}
+
+// 解密原图/原视频 → 内存 Blob URL
+async function encLoadOriginal(p, albumId) {
+  const albumKey = await encGetAlbumKey(albumId);
+  if (!albumKey) throw { message: '相册未解锁' };
+  const fileKey = await encGetFileKeyCached(p, albumKey);
+  const { meta, nonceBase } = await encGetMetaCached(p, fileKey);
+  const url = p.url || await freshPhotoUrl(p);
+  const resp = await fetch(url);
+  if (!resp.ok) throw { message: '下载密文失败' };
+  const ct = new Uint8Array(await resp.arrayBuffer());
+  const pt = await enc_decryptStream(fileKey, nonceBase, ct, meta.chunks);
+  return { blobUrl: URL.createObjectURL(new Blob([pt], { type: meta.contentType })), meta };
+}
+
+// 解密缩略图 → 设置 img.src（grid 用）
+async function encLoadThumb(p, imgEl, albumId) {
+  try {
+    const albumKey = await encGetAlbumKey(albumId);
+    if (!albumKey) return;
+    const fileKey = await encGetFileKeyCached(p, albumKey);
+    const { meta } = await encGetMetaCached(p, fileKey);
+    const resp = await fetch(p.thumbUrl);
+    if (!resp.ok) return;
+    const ct = new Uint8Array(await resp.arrayBuffer());
+    const pt = await enc_decryptBlob(fileKey, ct);
+    const type = meta.thumbs?.small || (p.kind === 'video' ? 'image/jpeg' : 'image/webp');
+    imgEl.src = URL.createObjectURL(new Blob([pt], { type }));
+  } catch { /* 解密失败保持占位 */ }
+}
+
+// 构建加密元数据（全部明文信息随照片一起加密）
+function encBuildMeta(file, uploadBlob, exif, thumbs, isVideo, duration, chunks) {
+  const meta = {
+    v: 1,
+    filename: file.name,
+    contentType: uploadBlob.type || file.type,
+    size: uploadBlob.size,
+    kind: isVideo ? 'video' : 'image',
+    chunks,
+  };
+  if (isVideo) {
+    if (duration != null) meta.duration = duration;
+  } else {
+    if (exif.takenAt) meta.takenAt = exif.takenAt;
+    if (exif.camera) meta.camera = exif.camera;
+    if (exif.gpsLat != null) { meta.gpsLat = exif.gpsLat; meta.gpsLng = exif.gpsLng; }
+    if (exif.exif) meta.exif = exif.exif;
+  }
+  const t = {};
+  if (thumbs.small) t.small = thumbs.small.type;
+  if (thumbs.large) t.large = thumbs.large.type;
+  if (thumbs.smallAvif) t.smallAvif = 'image/avif';
+  if (Object.keys(t).length) meta.thumbs = t;
+  return meta;
+}
+
 // ==================== API 调用 ====================
 
 // P3：Worker 列表接口带 max-age=30 私有缓存。任何写操作成功后 35s 内的 GET 用
@@ -240,15 +377,26 @@ function showLoginModal() {
   m.querySelector('#f-pw').focus();
 }
 
-function showUnlockModal(albumId, albumName) {
-  const m = promptModal(`输入「${albumName}」的密码`, `
-    <div class="field">
-      <input class="pw" id="f-pw" type="tel" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="off">
-    </div>`, async (m) => {
+function showUnlockModal(albumId, albumName, isEnc = false) {
+  const fieldHtml = isEnc
+    ? `<div class="field">
+         <label>加密口令（解密相册内容）</label>
+         <input id="f-pw" type="password" autocomplete="current-password" placeholder="输入创建时设置的口令">
+         <div class="hint">口令错误无法解密；口令丢失将永久无法恢复。</div>
+       </div>`
+    : `<div class="field">
+         <input class="pw" id="f-pw" type="tel" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="off">
+       </div>`;
+  const m = promptModal(`输入「${albumName}」的${isEnc ? '口令' : '密码'}`, fieldHtml, async (m) => {
     const pw = m.querySelector('#f-pw').value;
-    if (!/^\d{6}$/.test(pw)) throw { message: '请输入6位数字密码' };
-    const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw });
-    saveToken(sessionStorage, 'unlock_' + albumId, r.token, r.expiresIn);
+    if (isEnc) {
+      if (!pw) throw { message: '请输入口令' };
+      await encUnlockAndStore(albumId, pw);
+    } else {
+      if (!/^\d{6}$/.test(pw)) throw { message: '请输入6位数字密码' };
+      const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw });
+      saveToken(sessionStorage, 'unlock_' + albumId, r.token, r.expiresIn);
+    }
     location.hash = '#/album/' + albumId;
     render();
   }, '解锁');
@@ -372,7 +520,9 @@ async function renderAlbums() {
 }
 
 function openAlbum(a) {
-  if (a.locked && !isAdmin() && !getUnlockToken(a.id)) showUnlockModal(a.id, a.name);
+  // 加密相册（端到端）：无论管理员还是访客都需本会话解锁（服务端无口令，管理员也无法解密）
+  if (a.encrypted && !hasEncAlbumKey(a.id)) showUnlockModal(a.id, a.name, true);
+  else if (a.locked && !isAdmin() && !getUnlockToken(a.id)) showUnlockModal(a.id, a.name);
   else location.hash = '#/album/' + a.id + '?name=' + encodeURIComponent(a.name);
 }
 
@@ -397,6 +547,22 @@ function bindAlbumOps(card, a) {
 }
 
 function showAlbumForm(album) {
+  const isNew = !album;
+  const encFields = isNew ? `
+    <div class="field">
+      <label class="chk"><input type="checkbox" id="f-enc"> 加密相册（端到端加密，服务器无法读取内容）</label>
+      <div class="hint">加密相册不支持 AI 打标 / 语义搜索 / 证件照 / 换风格 / 视频转码；口令丢失将永久无法恢复。</div>
+    </div>
+    <div id="enc-pw-wrap" style="display:none">
+      <div class="field">
+        <label>加密口令（至少6位，请务必牢记）</label>
+        <input id="f-enc-pw" type="password" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label>确认口令</label>
+        <input id="f-enc-pw2" type="password" autocomplete="new-password">
+      </div>
+    </div>` : '';
   const m = promptModal(album ? '编辑相册' : '新建相册', `
     <div class="field">
       <label>相册名（事件/主题）</label>
@@ -405,13 +571,29 @@ function showAlbumForm(album) {
     <div class="field">
       <label>描述（可选）</label>
       <textarea id="f-desc" rows="2" maxlength="500" placeholder="一句话介绍">${esc(album?.description ?? '')}</textarea>
-    </div>`, async (m) => {
+    </div>
+    ${encFields}`, async (m) => {
     const name = m.querySelector('#f-name').value.trim();
     const desc = m.querySelector('#f-desc').value.trim();
     if (!name) throw { message: '请填写相册名' };
     if (album) {
       await api('PATCH', `/albums/${album.id}`, { name, description: desc });
       toast('已保存');
+    } else if (m.querySelector('#f-enc')?.checked) {
+      const pw1 = m.querySelector('#f-enc-pw').value;
+      const pw2 = m.querySelector('#f-enc-pw2').value;
+      if (pw1.length < 6) throw { message: '加密口令至少6位' };
+      if (pw1 !== pw2) throw { message: '两次输入的口令不一致' };
+      const albumKey = await enc_generateAlbumKey();
+      const salt = enc_randomBytes(16);
+      const kek = await enc_deriveKEK(pw1, salt, ENC_PBKDF2_ITERS);
+      const wrapped = await enc_wrapAlbumKey(albumKey, kek);
+      const r = await api('POST', '/albums', {
+        name, description: desc, encrypted: true,
+        encKey: JSON.stringify(wrapped), kekSalt: enc_b64url(salt), kekIters: ENC_PBKDF2_ITERS,
+      });
+      await encSetAlbumKey(r.album.id, albumKey);
+      toast('加密相册已创建');
     } else {
       await api('POST', '/albums', { name, description: desc });
       toast('相册已创建');
@@ -419,6 +601,12 @@ function showAlbumForm(album) {
     render();
   }, album ? '保存' : '创建');
   m.querySelector('#f-name').focus();
+  const chk = m.querySelector('#f-enc');
+  if (chk) {
+    chk.addEventListener('change', () => {
+      document.getElementById('enc-pw-wrap').style.display = chk.checked ? '' : 'none';
+    });
+  }
 }
 
 function showAlbumPwModal(a) {
@@ -563,23 +751,32 @@ function createPhotoItem(p, admin, eager = false) {
   item.className = 'photo-item' + (p.kind === 'video' ? ' is-video' : '')
     + (selectMode ? ' selecting' : '');
   item.dataset.photoId = p.id;
-  const srcset = p.largeUrl
-    ? `${esc(p.thumbUrl)} 1x, ${esc(p.largeUrl)} 2x`
-    : '';
-  const imgTag = `<img src="${esc(p.thumbUrl)}" ${srcset ? `srcset="${srcset}" sizes="(max-width:600px) 46vw, 220px"` : ''} ${eager ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async"${IMG_CORS_ATTR} alt="${esc(p.filename)}">`;
-  // AVIF 网格缩略图：Chrome/Edge 走 source 加载更小的 AVIF，Safari 回退 WebP/JPEG
-  const mediaHtml = p.thumbAvifUrl
-    ? `<picture><source type="image/avif" srcset="${esc(p.thumbAvifUrl)}">${imgTag}</picture>`
-    : imgTag;
+  // 加密相册：缩略图为密文，先占位再由 encLoadThumb 异步解密填入 blob URL
+  const altText = p.encrypted ? '加密照片' : esc(p.filename);
+  let mediaHtml;
+  if (p.encrypted) {
+    mediaHtml = `<img class="enc-thumb" ${eager ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async" alt="${altText}">`;
+  } else {
+    const srcset = p.largeUrl
+      ? `${esc(p.thumbUrl)} 1x, ${esc(p.largeUrl)} 2x`
+      : '';
+    const imgTag = `<img src="${esc(p.thumbUrl)}" ${srcset ? `srcset="${srcset}" sizes="(max-width:600px) 46vw, 220px"` : ''} ${eager ? 'fetchpriority="high"' : 'loading="lazy"'} decoding="async"${IMG_CORS_ATTR} alt="${altText}">`;
+    // AVIF 网格缩略图：Chrome/Edge 走 source 加载更小的 AVIF，Safari 回退 WebP/JPEG
+    mediaHtml = p.thumbAvifUrl
+      ? `<picture><source type="image/avif" srcset="${esc(p.thumbAvifUrl)}">${imgTag}</picture>`
+      : imgTag;
+  }
   item.innerHTML = `
     ${mediaHtml}
     ${selectMode ? '<span class="pick-check"></span>' : ''}
     ${p.isFavorite ? '<span class="fav-badge" title="已收藏">★</span>' : ''}
     ${p.kind === 'video' ? `<span class="video-badge">▶${p.duration ? '<i>' + esc(fmtDuration(p.duration)) + '</i>' : ''}</span>` : ''}
     ${admin ? '<button class="del" title="删除">×</button>' : ''}`;
-  // 模糊占位：先铺 thumbhash，缩略图加载完成后淡入并移除占位
+  // 模糊占位：先铺 thumbhash，缩略图加载完成后淡入并移除占位；加密相册无 thumbhash，改为解密缩略图
   const imgEl = item.querySelector('img');
-  if (p.thumbHash && window.ThumbHash) {
+  if (p.encrypted) {
+    encLoadThumb(p, imgEl, p.albumId || currentAlbumId);
+  } else if (p.thumbHash && window.ThumbHash) {
     const ph = makeThumbPlaceholder(p.thumbHash);
     if (ph) {
       item.insertBefore(ph, imgEl);
@@ -600,7 +797,7 @@ function createPhotoItem(p, admin, eager = false) {
   });
   item.querySelector('.del')?.addEventListener('click', async (e) => {
     e.stopPropagation();
-    if (!await confirmModal('删除照片', `「${p.filename}」将移入回收站，10 天内可还原。`, '移入回收站', true)) return;
+    if (!await confirmModal('删除照片', `「${p.filename || '加密照片'}」将移入回收站，10 天内可还原。`, '移入回收站', true)) return;
     try {
       await api('DELETE', `/photos/${p.id}`);
       recycleObserver?.unobserve(item);
@@ -950,15 +1147,21 @@ async function renderAlbum(albumId) {
     data = await api('GET', `/albums/${albumId}/photos?limit=${ALBUM_PAGE_SIZE}`, null, albumId);
   } catch (err) {
     if (err.status === 403) {
-      // 解锁 token 缺失/过期 → 重新输密码
+      // 解锁 token 缺失/过期 → 重新输入口令（加密相册走口令，普通相册走数字密码）
       sessionStorage.removeItem('unlock_' + albumId);
       const nameMatch = location.hash.match(/[?&]name=([^&]*)/);
       const name = nameMatch ? decodeURIComponent(nameMatch[1]) : '该相册';
-      showUnlockModal(albumId, name);
+      showUnlockModal(albumId, name, !!err.data?.encrypted);
       $view.innerHTML = `<div class="empty">此相册已上锁</div>`;
       return;
     }
     $view.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    return;
+  }
+  // 加密相册（端到端）：即便管理员，本会话未解锁也无法解密，强制先输口令
+  if (data.album.encrypted && !hasEncAlbumKey(albumId)) {
+    showUnlockModal(albumId, data.album.name, true);
+    $view.innerHTML = `<div class="empty">此相册为端到端加密，需输入口令解锁</div>`;
     return;
   }
   currentAlbumId = albumId;
@@ -969,23 +1172,24 @@ async function renderAlbum(albumId) {
   pageState = { cursor: data.nextCursor, loading: false, hasMore: !!data.nextCursor };
   const admin = isAdmin();
   const canEdit = canEditAlbum();
+  const isEncAlbum = !!data.album.encrypted;
 
   $view.innerHTML = `
     <div class="page-head">
-      <h1>${esc(data.album.name)}${data.album.locked ? ' <span class="lock" style="vertical-align:3px">已上锁</span>' : ''}</h1>
+      <h1>${esc(data.album.name)}${data.album.encrypted ? ' <span class="lock" style="vertical-align:3px">🔒 端到端加密</span>' : (data.album.locked ? ' <span class="lock" style="vertical-align:3px">已上锁</span>' : '')}</h1>
       <div class="page-actions">
         <a class="btn" href="#/albums">← 返回</a>
         ${data.photos.length ? '<button class="btn" id="btn-fav-only">⭐ 只看收藏</button>' : ''}
-        ${admin ? `<button class="btn" id="btn-share">🔗 分享</button>` : ''}
+        ${admin && !isEncAlbum ? `<button class="btn" id="btn-share">🔗 分享</button>` : ''}
         ${admin && data.photos.length ? `<button class="btn" id="btn-select-mode">☑ 多选</button>` : ''}
-        ${canEdit && data.photos.length ? `<button class="btn" id="btn-zip">⬇ 打包下载</button>` : ''}
+        ${canEdit && data.photos.length && !isEncAlbum ? `<button class="btn" id="btn-zip">⬇ 打包下载</button>` : ''}
         ${admin && data.album.coverPhotoId ? `
           <button class="btn" id="btn-clear-cover">取消自定义封面</button>` : ''}
-        ${admin && data.missingThumbs > 0 ? `
+        ${admin && data.missingThumbs > 0 && !isEncAlbum ? `
           <button class="btn" id="btn-backfill">回填历史缩略图（${data.missingThumbs}张）</button>` : ''}
-        ${canEdit && data.untaggedCount > 0 ? `
+        ${canEdit && data.untaggedCount > 0 && !isEncAlbum ? `
           <button class="btn" id="btn-backfill-tags">🏷 补打标签（${data.untaggedCount}张）</button>` : ''}
-        ${admin && data.photos.length ? `
+        ${admin && data.photos.length && !isEncAlbum ? `
           <button class="btn" id="btn-retag-tags" title="用新 AI 模型重新生成已有标签，覆盖旧标签">🔄 重打标签</button>` : ''}
         ${canEdit ? `
           <label class="btn primary" style="cursor:pointer">
@@ -1449,6 +1653,9 @@ async function uploadMultipart(blob, r, albumId, thumbs) {
 // 上传：浏览器端先解析 EXIF + 生成缩略图 → 拿预签名 URL → PUT 直传 R2 → confirm
 // 文件间串行（避免手机端内存过大），单文件内缩略图/分段并发
 async function uploadFiles(albumId, files) {
+  // 加密相册：本会话解锁后拿到相册主密钥，全链路加密上传
+  const albumKey = await encGetAlbumKey(albumId);
+  const isEnc = !!albumKey;
   // 疑似重复（同名同大小，仅对照已加载照片）：取消则跳过这些
   const dups = files.filter((f) =>
     currentPhotos.some((p) => p.filename === f.name && p.size === f.size));
@@ -1500,25 +1707,48 @@ async function uploadFiles(albumId, files) {
         ]);
         if (uploadBlob.size > COMPRESS_THRESHOLD) uploadBlob = await maybeCompress(uploadBlob);
       }
+      // 加密相册：原图/缩略图/元数据全部加密，服务端只存密文（明文只在浏览器）
+      let upBlob = uploadBlob;
+      const upThumbs = { small: thumbs.small, large: thumbs.large, smallAvif: thumbs.smallAvif };
+      let encKeyPayload = null, encMetaB64 = null;
+      if (isEnc) {
+        const fileKeyBytes = enc_generateFileKeyBytes();
+        const fileKey = await enc_importKey(fileKeyBytes);
+        encKeyPayload = JSON.stringify(await enc_encryptFileKey(fileKeyBytes, albumKey));
+        const nonceBase = enc_randomBytes(8);
+        const plainBuf = new Uint8Array(await uploadBlob.arrayBuffer());
+        const chunks = Math.max(1, Math.ceil(plainBuf.length / ENC_CHUNK));
+        upBlob = new Blob([await enc_encryptStream(fileKey, nonceBase, plainBuf)], { type: 'application/octet-stream' });
+        if (thumbs.small) upThumbs.small = new Blob([await enc_encryptBlob(fileKey, new Uint8Array(await thumbs.small.arrayBuffer()))], { type: 'application/octet-stream' });
+        if (thumbs.large) upThumbs.large = new Blob([await enc_encryptBlob(fileKey, new Uint8Array(await thumbs.large.arrayBuffer()))], { type: 'application/octet-stream' });
+        if (thumbs.smallAvif) upThumbs.smallAvif = new Blob([await enc_encryptBlob(fileKey, new Uint8Array(await thumbs.smallAvif.arrayBuffer()))], { type: 'application/octet-stream' });
+        encMetaB64 = await enc_encryptMeta(fileKey, encBuildMeta(file, uploadBlob, exif, thumbs, isVideo, duration, chunks), nonceBase);
+      }
       const createBody = {
-        filename: uploadBlob.name,
-        contentType: uploadBlob.type || file.type,
+        filename: isEnc ? 'encrypted' : uploadBlob.name,
+        contentType: isEnc ? (isVideo ? 'video/mp4' : 'image/jpeg') : uploadBlob.type || file.type,
         thumbContentType: thumbs.small ? thumbs.small.type : null,
         thumbAvifContentType: thumbs.smallAvif ? 'image/avif' : null,
       };
+      if (isEnc) {
+        createBody.encKey = encKeyPayload;
+        createBody.encMeta = encMetaB64;
+      }
       if (isVideo) {
         createBody.duration = duration;
-        // >100MB 大视频走分段上传（断点续传），弱网下分段重试而非整文件重传
-        if (uploadBlob.size > 100 * 1024 * 1024) createBody.multipart = true;
+        // >100MB 大视频走分段上传（断点续传）；加密相册密文整体在内存，直接单 PUT
+        if (uploadBlob.size > 100 * 1024 * 1024 && !isEnc) createBody.multipart = true;
       } else {
-        createBody.takenAt = exif.takenAt;
-        createBody.camera = exif.camera;
-        createBody.gpsLat = exif.gpsLat;
-        createBody.gpsLng = exif.gpsLng;
-        if (exif.exif) createBody.exif = exif.exif;
+        createBody.takenAt = exif.takenAt; // 拍摄时间保留明文（时间线需要）；其余元数据进加密 meta
+        if (!isEnc) {
+          createBody.camera = exif.camera;
+          createBody.gpsLat = exif.gpsLat;
+          createBody.gpsLng = exif.gpsLng;
+          if (exif.exif) createBody.exif = exif.exif;
+        }
       }
-      // 上传体 ≤50MB 才算哈希，做同相册重复检测；>50MB 跳过
-      if (uploadBlob.size > 0 && uploadBlob.size <= 50 * 1024 * 1024) {
+      // 上传体 ≤50MB 才算哈希，做同相册重复检测；>50MB 跳过；加密相册不算（会泄露明文哈希）
+      if (!isEnc && uploadBlob.size > 0 && uploadBlob.size <= 50 * 1024 * 1024) {
         try { createBody.sha256 = await sha256Hex(uploadBlob); } catch { /* 忽略 */ }
       }
       let r;
@@ -1536,37 +1766,42 @@ async function uploadFiles(albumId, files) {
       const thumbPuts = [];
       if (r.thumbUploadUrl) {
         thumbPuts.push(fetch(r.thumbUploadUrl, {
-          method: 'PUT', body: thumbs.small, headers: { 'Content-Type': thumbs.small.type },
+          method: 'PUT', body: upThumbs.small, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : upThumbs.small.type },
         }));
         thumbPuts.push(fetch(r.largeUploadUrl, {
-          method: 'PUT', body: thumbs.large, headers: { 'Content-Type': thumbs.large.type },
+          method: 'PUT', body: upThumbs.large, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : upThumbs.large.type },
         }));
       }
-      if (r.thumbAvifUploadUrl && thumbs.smallAvif) {
+      if (r.thumbAvifUploadUrl && upThumbs.smallAvif) {
         thumbPuts.push(fetch(r.thumbAvifUploadUrl, {
-          method: 'PUT', body: thumbs.smallAvif, headers: { 'Content-Type': 'image/avif' },
+          method: 'PUT', body: upThumbs.smallAvif, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : 'image/avif' },
         }));
       }
       if (thumbPuts.length) {
         const thumbResps = await Promise.all(thumbPuts);
         if (thumbResps.some((x) => !x.ok)) throw { message: '缩略图直传失败' };
       }
-      // 主文件：大视频走分段续传，其余单 PUT
+      // 主文件：大视频走分段续传（仅非加密），其余单 PUT
       if (r.multipart) {
         await uploadMultipart(uploadBlob, r, albumId, thumbs);
       } else {
         const resp = await fetch(r.uploadUrl, {
-          method: 'PUT', body: uploadBlob, headers: { 'Content-Type': uploadBlob.type || file.type },
+          method: 'PUT', body: upBlob, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : upBlob.type || file.type },
         });
         if (!resp.ok) throw { message: '直传 R2 失败' };
-        // 图片计算 dHash 用于重复检测；视频用封面帧（若有）
-        const phashBlob = isVideo ? thumbs.small : uploadBlob;
-        const phash = phashBlob ? await computeDHash(phashBlob) : null;
-        const confirmBody = {};
-        if (phash) confirmBody.phash = phash;
-        if (thumbs.thumbHash) confirmBody.thumbHash = thumbs.thumbHash;
-        await api('POST', `/photos/${r.photoId}/confirm`,
-          Object.keys(confirmBody).length ? confirmBody : null, albumId);
+        // 加密相册不算 dHash/thumbHash（会泄露明文内容）
+        if (isEnc) {
+          await api('POST', `/photos/${r.photoId}/confirm`, null, albumId);
+        } else {
+          // 图片计算 dHash 用于重复检测；视频用封面帧（若有）
+          const phashBlob = isVideo ? thumbs.small : uploadBlob;
+          const phash = phashBlob ? await computeDHash(phashBlob) : null;
+          const confirmBody = {};
+          if (phash) confirmBody.phash = phash;
+          if (thumbs.thumbHash) confirmBody.thumbHash = thumbs.thumbHash;
+          await api('POST', `/photos/${r.photoId}/confirm`,
+            Object.keys(confirmBody).length ? confirmBody : null, albumId);
+        }
       }
       done++;
     } catch (err) {
@@ -1668,9 +1903,39 @@ function prefetchViewerNeighbors(idx) {
   }
 }
 
+// 加密照片/视频：拉取密文 → 本地解密 → Blob URL 展示（服务器全程看不到明文）
+async function showEncryptedMedia(q, mediaBox) {
+  try {
+    const { blobUrl, meta } = await encLoadOriginal(q, q.albumId || currentAlbumId);
+    q.filename = meta.filename || q.filename;
+    q.camera = meta.camera ?? null;
+    q.exif = meta.exif ?? null;
+    if (meta.kind === 'video') {
+      const video = document.createElement('video');
+      video.controls = true;
+      video.playsInline = true;
+      video.preload = 'metadata';
+      video.className = 'v-video';
+      video.src = blobUrl;
+      mediaBox.appendChild(video);
+    } else {
+      const img = document.createElement('img');
+      img.className = 'loading';
+      img.alt = meta.filename || '';
+      img.addEventListener('load', () => img.classList.remove('loading'));
+      img.addEventListener('error', () => img.classList.remove('loading'));
+      img.src = blobUrl;
+      mediaBox.appendChild(img);
+    }
+  } catch (err) {
+    mediaBox.innerHTML = `<div class="empty">解密失败：${esc(err.message || '无法加载')}</div>`;
+  }
+}
+
 function openViewer(i) {
   viewerIdx = i;
   const p = currentPhotos[i];
+  const isEncPhoto = !!p.encrypted;
   const el = document.createElement('div');
   el.className = 'viewer';
   el.innerHTML = `
@@ -1681,12 +1946,12 @@ function openViewer(i) {
     <div class="v-bar">
       ${currentPhotos.length > 1 ? '<button class="v-btn" data-a="slideshow">▶ 幻灯片</button>' : ''}
       ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn" data-a="cover">📌 设为封面</button>' : ''}
-      ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn" data-a="share-one">分享这张</button>' : ''}
-      ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn" data-a="retag">🔄 重打标签</button>' : ''}
+      ${isAdmin() && !shareMode && !viewerCrossAlbum && !isEncPhoto ? '<button class="v-btn" data-a="share-one">分享这张</button>' : ''}
+      ${isAdmin() && !shareMode && !viewerCrossAlbum && !isEncPhoto ? '<button class="v-btn" data-a="retag">🔄 重打标签</button>' : ''}
       ${isAdmin() && !shareMode && !viewerCrossAlbum ? '<button class="v-btn v-del" data-a="delete">🗑 删除</button>' : ''}
       ${canEditAlbum() && !viewerCrossAlbum ? '<button class="v-btn" data-a="fav"></button>' : ''}
-      ${canEditAlbum() && !viewerCrossAlbum ? '<button class="v-btn" data-a="caption">✏️ 备注</button>' : ''}
-      ${shareMode || p.kind === 'video' || viewerCrossAlbum ? '' : `
+      ${canEditAlbum() && !viewerCrossAlbum && !isEncPhoto ? '<button class="v-btn" data-a="caption">✏️ 备注</button>' : ''}
+      ${shareMode || p.kind === 'video' || viewerCrossAlbum || isEncPhoto ? '' : `
       <button class="v-btn" data-a="idphoto">制作证件照</button>
       <button class="v-btn" data-a="style">换风格</button>
       <button class="v-btn" data-a="bg">更换背景</button>`}
@@ -1703,9 +1968,15 @@ function openViewer(i) {
   const showAt = async (idx) => {
     const q = currentPhotos[idx];
     if (activeHls) { try { activeHls.destroy(); } catch { /* ignore */ } activeHls = null; }
-    el.querySelector('.v-name').textContent = `${q.filename} · ${fmtSize(q.size)}`;
+    if (q.encrypted) await encHydratePhoto(q, q.albumId || currentAlbumId);
+    el.querySelector('.v-name').textContent = `${q.filename || '加密照片'} · ${fmtSize(q.size)}`;
     el.querySelector('#v-info').innerHTML = viewerInfoHtml(q);
     mediaBox.innerHTML = '';
+    if (q.encrypted) {
+      await showEncryptedMedia(q, mediaBox);
+      syncFavBtn();
+      return;
+    }
     if (q.kind === 'video') {
       const wrap = document.createElement('div');
       wrap.className = 'v-video-wrap';
@@ -1953,9 +2224,19 @@ function openViewer(i) {
   el.querySelector('[data-a="download"]').addEventListener('click', async () => {
     // 桶配置 CORS 后，取 blob 触发真实下载；否则浏览器会直接打开原图
     const q = currentPhotos[viewerIdx];
-    let url = q.url;
     try {
       toast('开始下载…');
+      // 加密照片：先本地解密再下载明文
+      if (q.encrypted) {
+        const { blobUrl, meta } = await encLoadOriginal(q, q.albumId || currentAlbumId);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = meta.filename || (q.kind === 'video' ? 'video' : 'photo');
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        return;
+      }
+      let url = q.url;
       if (!url) url = await freshPhotoUrl(q);
       const resp = await fetch(url);
       const blob = await resp.blob();
@@ -1964,7 +2245,7 @@ function openViewer(i) {
       a.download = q.filename;
       a.click();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    } catch { if (url) window.open(url, '_blank'); }
+    } catch { if (q.url) window.open(q.url, '_blank'); }
   });
 
   // 收藏切换（管理员或相册解锁游客；写入后同步按钮文案与网格角标）
