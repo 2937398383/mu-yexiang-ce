@@ -119,10 +119,16 @@ function renderAuthArea() {
 
 // ==================== Turnstile（人机验证，防密码爆破） ====================
 
+// 是否启用人机验证：需站点密钥已配置且 SDK 已加载（未配置则整体降级，不影响登录/解锁）
+function turnstileEnabled() {
+  return !!(window.TURNSTILE_SITE_KEY && window.turnstile);
+}
+
 // 在弹窗打开后手动渲染 widget（render=explicit）
 function renderTurnstileInto(containerId) {
+  if (!turnstileEnabled()) return;
   const el = document.getElementById(containerId);
-  if (window.turnstile && el && !el.dataset.rendered) {
+  if (el && !el.dataset.rendered) {
     window.turnstile.render('#' + containerId, {
       sitekey: window.TURNSTILE_SITE_KEY,
       theme: 'auto',
@@ -131,10 +137,11 @@ function renderTurnstileInto(containerId) {
   }
 }
 
-// 提交时取 token，未通过则拦截
+// 提交时取 token；未启用验证码则返回 undefined（后端同样降级放行）
 function turnstileToken(containerId) {
+  if (!turnstileEnabled()) return undefined;
   const el = document.getElementById(containerId);
-  if (window.turnstile && el) {
+  if (el) {
     const t = window.turnstile.getResponse(el);
     if (t) return t;
   }

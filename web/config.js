@@ -2,5 +2,7 @@
 // 例：window.API_BASE = "https://album-api.xxxxx.workers.dev/api";
 window.API_BASE = "https://api.cdc2937398383qqcom.dpdns.org/api";
 
-// Cloudflare Turnstile 站点密钥（公开值，安全）。在 Cloudflare 控制台 → Turnstile 新建 Widget 后填入。
-window.TURNSTILE_SITE_KEY = "在此填入Turnstile_Site_Key";
+// Cloudflare Turnstile 站点密钥（公开值，安全）。留空 = 未启用人机验证（登录/解锁照常，无验证码）。
+// 启用方式：Cloudflare 控制台 → Turnstile → 新建 Widget，把 Site Key 填到这里，并把 Secret Key 用
+// `wrangler secret put TURNSTILE_SECRET` 配到后端（前后端需同时启用）。
+window.TURNSTILE_SITE_KEY = "";
