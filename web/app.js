@@ -1659,7 +1659,8 @@ async function uploadMultipart(blob, r, albumId, thumbs) {
         const su = await api('POST', `/photos/${r.photoId}/upload-part`,
           { uploadId: r.uploadId, partNumber }, albumId);
         const resp = await fetch(su.url, {
-          method: 'PUT', body: chunk, headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+          method: 'PUT', body: chunk,
+          headers: { 'Content-Type': su.contentType || r.uploadContentType || 'application/octet-stream' },
         });
         if (!resp.ok) throw { message: `分段 ${partNumber} 直传失败` };
         const etag = resp.headers.get('etag');
@@ -1723,6 +1724,7 @@ async function uploadFiles(albumId, files) {
   const total = files.length;
   let started = 0, done = 0, failed = 0, skipped = 0;
   const activeNames = new Set();
+  let r2Warned = false; // 存储告警只弹一次，避免批量上传时刷屏
 
   const renderProgress = () => {
     const finished = done + failed + skipped;
@@ -1811,19 +1813,24 @@ async function uploadFiles(albumId, files) {
         }
         throw err;
       }
+      if (r.r2Warning && !r2Warned) {
+        r2Warned = true;
+        toast(r.r2Warning, true);
+      }
       // 缩略图/封面帧（小文件，先于主文件完成——confirm/complete 会校验其存在）
+      // Content-Type 必须用服务端返回的权威值（已纳入预签名 SigV4 签名，不一致会被 R2 拒绝）
       const thumbPuts = [];
       if (r.thumbUploadUrl) {
         thumbPuts.push(fetch(r.thumbUploadUrl, {
-          method: 'PUT', body: upThumbs.small, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : upThumbs.small.type },
+          method: 'PUT', body: upThumbs.small, headers: { 'Content-Type': r.thumbUploadContentType || 'application/octet-stream' },
         }));
         thumbPuts.push(fetch(r.largeUploadUrl, {
-          method: 'PUT', body: upThumbs.large, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : upThumbs.large.type },
+          method: 'PUT', body: upThumbs.large, headers: { 'Content-Type': r.thumbUploadContentType || 'application/octet-stream' },
         }));
       }
       if (r.thumbAvifUploadUrl && upThumbs.smallAvif) {
         thumbPuts.push(fetch(r.thumbAvifUploadUrl, {
-          method: 'PUT', body: upThumbs.smallAvif, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : 'image/avif' },
+          method: 'PUT', body: upThumbs.smallAvif, headers: { 'Content-Type': r.avifUploadContentType || 'application/octet-stream' },
         }));
       }
       if (thumbPuts.length) {
@@ -1835,7 +1842,7 @@ async function uploadFiles(albumId, files) {
         await uploadMultipart(uploadBlob, r, albumId, thumbs);
       } else {
         const resp = await fetch(r.uploadUrl, {
-          method: 'PUT', body: upBlob, headers: { 'Content-Type': isEnc ? 'application/octet-stream' : upBlob.type || file.type },
+          method: 'PUT', body: upBlob, headers: { 'Content-Type': r.uploadContentType || 'application/octet-stream' },
         });
         if (!resp.ok) throw { message: '直传 R2 失败' };
         // 加密相册不算 dHash/thumbHash（会泄露明文内容）
@@ -3095,6 +3102,13 @@ async function renderStats() {
   const q = data.quota;
   const pct = q.usagePercent;
   const barClass = pct >= 90 ? 'danger' : pct >= 70 ? 'warn' : '';
+  // 成本护栏：Images 月度用量（免费 5000 次/月）与 R2 95% 告警
+  const g = data.guard || {};
+  const imgUsed = g.images?.used ?? 0;
+  const imgCap = g.images?.cap ?? 4500;
+  const imgFree = g.images?.free ?? 5000;
+  const imgPct = Math.min(100, Math.round((imgUsed / imgFree) * 100));
+  const imgBarClass = imgPct >= 90 ? 'danger' : imgPct >= 70 ? 'warn' : '';
 
   // D1 免费额度：读 500 万行/天、写 10 万行/天（UTC 自然日重置）；每月为当月累计，无月度上限
   const d1 = data.d1;
@@ -3131,6 +3145,7 @@ async function renderStats() {
         <div class="quota-desc">
           已用 <b>${esc(fmtSize(q.usedBytes))}</b> · 剩余 <b>${esc(fmtSize(q.remainBytes))}</b> · 占用 ${pct}%
         </div>
+        ${g.r2Alert ? `<div class="quota-desc" style="color:#e5484d">⚠️ 存储已超过 95% 免费额度，访客上传已冻结；请清理回收站/重复照片，或清理孤儿文件</div>` : ''}
       </div>
       <div class="quota-bar-wrap">
         <div class="quota-bar">
@@ -3138,7 +3153,23 @@ async function renderStats() {
         </div>
         <div class="quota-bar-text">${pct}%</div>
       </div>
-      <a class="btn btn-upgrade" href="https://dash.cloudflare.com/?to=/:account/r2/plans" target="_blank" rel="noopener">⚡ 立即扩容</a>
+      <div class="page-actions" style="margin-top:10px">
+        <button class="btn" id="btn-cleanup-orphans">🧹 清理孤儿文件（无引用的历史残留）</button>
+        <a class="btn btn-upgrade" href="https://dash.cloudflare.com/?to=/:account/r2/plans" target="_blank" rel="noopener">⚡ 立即扩容</a>
+      </div>
+    </div>
+
+    <div class="quota-card">
+      <div class="quota-info">
+        <div class="quota-title">☁️ Images 转换 <span class="quota-tag">免费 5,000 次/月</span></div>
+        <div class="quota-desc">
+          本月已用 <b>${imgUsed}</b> 次（熔断线 ${imgCap}，超限自动停用避免计费；云端抠图/缩略图回填均计入）
+        </div>
+      </div>
+      <div class="quota-bar-wrap">
+        <div class="quota-bar"><div class="quota-bar-fill ${imgBarClass}" style="width:${imgPct}%"></div></div>
+        <div class="quota-bar-text">${imgPct}%</div>
+      </div>
     </div>
 
     <div class="quota-card">
@@ -3215,6 +3246,34 @@ async function renderStats() {
       }
     } catch (err) {
       toast('重建中断：' + err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // R2 孤儿文件清理（对照 photo 表引用，删除历史残留对象，直接降低存储占用）
+  document.getElementById('btn-cleanup-orphans')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const ok = await confirmModal(
+      '清理孤儿文件',
+      '将扫描 R2 中所有对象，删除不再被任何照片引用的历史残留（旧版本变体、上传中断残留等）。扫描/删除不影响正常照片。确定继续？',
+      '开始清理', true
+    );
+    if (!ok) return;
+    btn.disabled = true;
+    btn.textContent = '🧹 清理中…';
+    try {
+      let r, rounds = 0, deleted = 0;
+      do {
+        r = await api('POST', '/admin/cleanup-orphans');
+        deleted += r.deleted || 0;
+        rounds++;
+      } while (r.hasMore && rounds < 20);
+      toast(`清理完成：扫描 ${r.scanned} 个对象，删除 ${deleted} 个孤儿文件`);
+      btn.textContent = '🧹 清理孤儿文件（无引用的历史残留）';
+    } catch (err) {
+      toast('清理失败：' + err.message, true);
+      btn.textContent = '🧹 清理孤儿文件（无引用的历史残留）';
     } finally {
       btn.disabled = false;
     }
