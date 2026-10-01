@@ -2,6 +2,8 @@
 // 公开可用，D1 限流：非管理员每 IP 每天 DAILY_LIMIT 张；管理员不限
 // Images Free 计划：每月 5000 次变换免费，无需任何密钥（binding 直连）
 import { getAuth } from './auth.js';
+import { consumeWindowQuota, refundWindowQuota } from './quota.js';
+import { consumeImagesQuota, refundImagesQuota } from './cost-guard.js';
 
 const DAILY_LIMIT = 15;             // 非管理员每日每 IP 限额
 const MAX_DATAURI_LEN = 11_000_000; // data URI 上限（约 8MB 原图）
@@ -33,29 +35,15 @@ function todayUTC() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// 原子消费（quota.js）：检查与自增单语句完成，并发下不超限
 async function checkAndConsumeQuota(env, ip) {
-  const day = todayUTC();
-  const row = await env.DB.prepare(
-    'SELECT count FROM idphoto_quota WHERE ip = ? AND day = ?'
-  ).bind(ip, day).first();
-  const used = row?.count ?? 0;
-  if (used >= DAILY_LIMIT) {
-    return { allowed: false, remaining: 0 };
-  }
-  await env.DB.prepare(
-    `INSERT INTO idphoto_quota (ip, day, count, updated_at)
-     VALUES (?, ?, 1, datetime('now'))
-     ON CONFLICT(ip, day) DO UPDATE SET count = count + 1, updated_at = datetime('now')`
-  ).bind(ip, day).run();
-  return { allowed: true, remaining: DAILY_LIMIT - used - 1 };
-}
-
-// 处理失败时退还当日额度
-async function refundQuota(env, ip) {
-  await env.DB.prepare(
-    `UPDATE idphoto_quota SET count = MAX(count - 1, 0), updated_at = datetime('now')
-     WHERE ip = ? AND day = ?`
-  ).bind(ip, todayUTC()).run();
+  const r = await consumeWindowQuota(env, {
+    table: 'idphoto_quota',
+    keys: [['ip', ip], ['day', todayUTC()]],
+    limit: DAILY_LIMIT,
+    touchUpdatedAt: true,
+  });
+  return { allowed: r.allowed, remaining: r.allowed ? DAILY_LIMIT - r.count : 0 };
 }
 
 // data URI → Uint8Array
@@ -99,10 +87,17 @@ export async function handleCloudCutout(request, env) {
   const isAdmin = !!auth && auth.role === 'admin';
 
   const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  // Images 月度总量护栏（对所有人生效，含管理员）：免费层 5000 次/月，超量会计费
+  const images = await consumeImagesQuota(env);
+  if (!images.allowed) {
+    return jsonFail('本月云端精修免费额度已用完（每月 5000 次），下月再试或使用本地 AI', 429);
+  }
+  // 每 IP 每日限额（管理员不限次，但仍计入月度总量）
   let quota = null;
   if (!isAdmin) {
     quota = await checkAndConsumeQuota(env, ip);
     if (!quota.allowed) {
+      await refundImagesQuota(env);
       return jsonFail(`今日云端精修额度已用完（每天 ${DAILY_LIMIT} 张），明天再来或使用本地 AI`, 429);
     }
   }
@@ -111,13 +106,16 @@ export async function handleCloudCutout(request, env) {
   try {
     body = await request.json();
   } catch {
+    await refundImagesQuota(env);
     return jsonFail('请求体不是合法 JSON');
   }
   const image = body.image;
   if (typeof image !== 'string' || !/^data:image\/(png|jpe?g|webp|bmp);base64,/.test(image)) {
+    await refundImagesQuota(env);
     return jsonFail('缺少 image 参数（需为 base64 data URI 图片）');
   }
   if (image.length > MAX_DATAURI_LEN) {
+    await refundImagesQuota(env);
     return jsonFail('图片过大，请压缩后再试（建议宽度不超过 2000px）', 413);
   }
 
@@ -132,7 +130,8 @@ export async function handleCloudCutout(request, env) {
       },
     });
   } catch (e) {
-    if (quota) await refundQuota(env, ip);
+    if (quota) await refundWindowQuota(env, { table: 'idphoto_quota', keys: [['ip', ip], ['day', todayUTC()]] });
+    await refundImagesQuota(env);
     return jsonFail(e?.message ?? '云端精修失败', e?.status ?? 502);
   }
 }

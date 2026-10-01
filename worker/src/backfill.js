@@ -2,6 +2,8 @@
 // 由管理员触发（POST /api/admin/backfill-thumbs），每批 BATCH_SIZE 张：
 //   R2 取原图 → Images 双尺寸 WebP（400 / 1600）→ 写回 R2 → 更新 D1
 // Free 计划每月 5000 unique transformations（每张照片 2 次）；input 上限 20MB。
+// 月度用量由 cost-guard 计量（app_meta），达到熔断线时返回 quotaExhausted。
+import { takeImagesQuota, refundImagesQuota } from './cost-guard.js';
 
 const BATCH_SIZE = 5;
 const MAX_INPUT_BYTES = 20_000_000;
@@ -77,6 +79,10 @@ export async function runBackfillBatch(env, opts = {}) {
       const obj = await env.R2.get(p.object_key);
       const bytes = await obj.arrayBuffer();
 
+      // Images 月度护栏：每张 2 次变换，先原子计量再调用，调用失败退款
+      const take = await takeImagesQuota(env, 2);
+      if (!take.allowed) { quotaExhausted = true; break; }
+
       let smallBytes, largeBytes;
       try {
         // 两次独立 pipeline（参数组合不同，各自计一次 unique transformation）
@@ -85,6 +91,7 @@ export async function runBackfillBatch(env, opts = {}) {
           imageToWebp(env, bytes, 1600, 85),
         ]);
       } catch (e) {
+        await refundImagesQuota(env); await refundImagesQuota(env);
         if (isQuotaError(String(e?.message ?? e))) {
           quotaExhausted = true;
           break;

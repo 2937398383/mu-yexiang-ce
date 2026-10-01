@@ -12,15 +12,19 @@ const PHOTO_COLS =
           p.content_type, p.size, p.created_at, p.taken_at, p.camera,
           p.trashed_at, p.album_id, a.name AS album_name`;
 
-// 统一物理删除：R2 对象（原图+缩略图，批量合并）→ DB 行 → 封面引用清空
+// 照片在 R2 的全部衍生对象 key（原图/缩略图/中图/双 AVIF/视频代理），物理删除必须全覆盖，
+// 漏一类就永久残留 → 白白占用 R2 免费额度（10GB）
+const ALL_KEY_COLS = ['object_key', 'thumb_key', 'large_key', 'thumb_avif_key', 'large_avif_key', 'proxy_key'];
+
+// 统一物理删除：R2 对象（原图+全部衍生变体，批量合并）→ DB 行 → 封面引用清空
 export async function purgePhotos(env, rows) {
   if (!rows.length) return;
   const keys = new Set();
   const ids = [];
   for (const r of rows) {
     ids.push(r.id);
-    for (const k of [r.object_key, r.thumb_key, r.large_key]) {
-      if (k) keys.add(k);
+    for (const col of ALL_KEY_COLS) {
+      if (r[col]) keys.add(r[col]);
     }
   }
   const keyArr = [...keys];
@@ -125,7 +129,7 @@ export async function restorePhoto(env, photoId, targetAlbumId) {
 // 清空回收站：单轮 EMPTY_BATCH 张，返回已删/剩余，供前端循环
 export async function emptyTrashBatch(env) {
   const { results } = await env.DB.prepare(
-    `SELECT id, object_key, thumb_key, large_key FROM photo
+    `SELECT id, ${ALL_KEY_COLS.join(', ')} FROM photo
       WHERE status = 'trashed'
       ORDER BY trashed_at ASC
       LIMIT ?`
@@ -143,7 +147,7 @@ export async function runScheduledCleanup(env) {
 
   // ① 超过保留天数
   const { results: expired } = await env.DB.prepare(
-    `SELECT id, object_key, thumb_key, large_key FROM photo
+    `SELECT id, ${ALL_KEY_COLS.join(', ')} FROM photo
       WHERE status = 'trashed' AND trashed_at < datetime('now', ?)
       LIMIT ?`
   ).bind(`-${AGE_DAYS} days`, CRON_MAX).all();
@@ -162,7 +166,7 @@ export async function runScheduledCleanup(env) {
     while (used < budget) {
       const take = Math.min(50, budget - used);
       const { results: batch } = await env.DB.prepare(
-        `SELECT id, object_key, thumb_key, large_key, size FROM photo
+        `SELECT id, ${ALL_KEY_COLS.join(', ')}, size FROM photo
           WHERE status = 'trashed'
           ORDER BY trashed_at ASC
           LIMIT ?`
@@ -189,9 +193,11 @@ export async function runScheduledCleanup(env) {
     for (const o of orphans) {
       if (o.object_key) {
         keys.add(o.object_key);
-        // 推导缩略图 key（与上传 key 规则一致）
-        keys.add(o.object_key.replace(/(\.[^.]+)$/, '.s$1'));
-        keys.add(o.object_key.replace(/(\.[^.]+)$/, '.m$1'));
+        // 推导全部衍生 key（与上传 key 规则一致：缩略图可能是 jpg/webp/avif，视频有 proxy）
+        const base = o.object_key.replace(/\.[^.]+$/, '');
+        for (const s of ['.s.jpg', '.m.jpg', '.s.webp', '.m.webp', '.s.avif', '.m.avif', '.proxy.mp4']) {
+          keys.add(base + s);
+        }
       }
     }
     const keyArr = [...keys];
@@ -225,4 +231,39 @@ export async function runScheduledCleanup(env) {
   ).run();
 
   return summary;
+}
+
+// 管理员一键清理 R2 孤儿对象：遍历 albums/ 前缀，删除 photo 表无引用的对象
+// （历史版本泄漏的 AVIF/proxy 变体、上传中断残留等）。单轮最多扫 6000 个对象，
+// 响应带 hasMore 提示是否继续调用。R2 list 属 Class B 操作（免费 1000 万次/月）。
+export async function cleanupOrphans(env) {
+  const referenced = new Set();
+  const { results } = await env.DB.prepare(
+    `SELECT ${ALL_KEY_COLS.join(', ')} FROM photo`
+  ).all();
+  for (const r of results) {
+    for (const col of ALL_KEY_COLS) {
+      if (r[col]) referenced.add(r[col]);
+    }
+  }
+
+  const SCAN_LIMIT = 6000;
+  let scanned = 0;
+  const orphans = [];
+  let cursor;
+  do {
+    const list = await env.R2.list({ prefix: 'albums/', cursor, limit: 1000 });
+    scanned += list.objects.length;
+    for (const obj of list.objects) {
+      if (!referenced.has(obj.key)) orphans.push(obj.key);
+    }
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor && scanned < SCAN_LIMIT && orphans.length < SCAN_LIMIT);
+
+  let deleted = 0;
+  for (let i = 0; i < orphans.length; i += 1000) {
+    await env.R2.delete(orphans.slice(i, i + 1000));
+    deleted += Math.min(1000, orphans.length - i);
+  }
+  return { scanned, deleted, orphans, hasMore: !!cursor };
 }

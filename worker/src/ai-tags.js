@@ -1,6 +1,7 @@
 // AI 照片标签：Workers AI Llama 3.2 11B Vision 图生文，异步打标，失败不阻塞主流程
 // 额度：全站每日 200 张（免费层 10000 neurons/天，单张实测约 5~20 neurons，留足余量）
 // 2026-09-27：LLaVA 1.5 7B → Llama 3.2 11B Vision；结构化 JSON 输出 + 同义词归一/包含去重
+import { consumeWindowQuota } from './quota.js';
 
 const MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
 // bge-m3：多语言（含中文）文本向量，1024 维；2026-09 实测中文家庭相册查询 7/7 命中，
@@ -72,17 +73,14 @@ function todayUTC() {
   return new Date().toISOString().slice(0, 10);
 }
 
-// 额度预检 + 消费（原子：先查后加，单日最多 DAILY_LIMIT 张）
+// 额度预检 + 消费（原子：quota.js 单语句完成检查与自增，并发下不超每日全站限额）
 async function consumeQuota(env) {
-  const day = todayUTC();
-  const row = await env.DB.prepare('SELECT count FROM ai_tag_daily WHERE day = ?')
-    .bind(day).first();
-  if ((row?.count ?? 0) >= DAILY_LIMIT) return false;
-  await env.DB.prepare(
-    `INSERT INTO ai_tag_daily (day, count) VALUES (?, 1)
-     ON CONFLICT(day) DO UPDATE SET count = count + 1`
-  ).bind(day).run();
-  return true;
+  const r = await consumeWindowQuota(env, {
+    table: 'ai_tag_daily',
+    keys: [['day', todayUTC()]],
+    limit: DAILY_LIMIT,
+  });
+  return r.allowed;
 }
 
 // 打标失败（模型异常/结果无效）时退还已扣的当日额度

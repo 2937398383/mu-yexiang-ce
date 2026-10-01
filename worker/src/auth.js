@@ -88,6 +88,23 @@ export async function getAuth(request, env) {
   return verifyJwt(header.slice(7).trim(), env.JWT_SECRET);
 }
 
+/**
+ * 常量时间字符串比较：先对两侧各做一次 SHA-256（归一化长度，消除长度侧信道），
+ * 再用 Workers 内置的 timingSafeEqual 逐字节比较（不可用时退化为全量异或累积，无提前返回）。
+ * 用于密码/哈希比对，防止时序侧信道逐字节猜测。
+ */
+export async function timingSafeEqualStr(a, b) {
+  const da = await crypto.subtle.digest('SHA-256', enc.encode(String(a)));
+  const db = await crypto.subtle.digest('SHA-256', enc.encode(String(b)));
+  if (typeof crypto.subtle.timingSafeEqual === 'function') {
+    return crypto.subtle.timingSafeEqual(da, db);
+  }
+  const x = new Uint8Array(da), y = new Uint8Array(db);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
 // ---------- 相册密码 ----------
 
 // 固定前缀做域分隔，防止与其他用途的 SHA-256 值撞库

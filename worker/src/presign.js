@@ -33,6 +33,8 @@ function r2Url(env, objectKey) {
  * @param {number} expiresSeconds 有效期
  * @param {object} [opts]
  * @param {string} [opts.cacheControl] GET 时覆盖响应 Cache-Control（如 'public, max-age=31536000, immutable'）
+ * @param {string} [opts.contentType] PUT 时把 Content-Type 纳入 SigV4 签名，
+ *   前端上传必须携带同值请求头，否则 R2 返回签名错误——从协议层锁定对象 MIME，防止恶意类型入库
  * @param {object} [opts.query] 额外的 S3 查询参数（如分段上传的 partNumber/uploadId，会一并签名）
  * @returns {Promise<string>} 签名后的完整 URL
  */
@@ -48,7 +50,9 @@ export async function presignR2(env, method, objectKey, expiresSeconds, opts = {
       if (v != null) url.searchParams.set(k, String(v));
     }
   }
-  const request = new Request(url, { method });
+  const headers = method === 'PUT' && opts.contentType
+    ? { 'Content-Type': opts.contentType } : undefined;
+  const request = new Request(url, { method, headers });
   const signed = await getClient(env).sign(request, { aws: { signQuery: true } });
   return signed.url;
 }
@@ -64,9 +68,10 @@ function escapeXml(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&apos;', '"': '&quot;' }[c]));
 }
 
-/** 发起分段上传，返回 uploadId */
-export async function initiateMultipart(env, objectKey) {
-  const resp = await getClient(env).fetch(r2Url(env, objectKey) + '?uploads', { method: 'POST' });
+/** 发起分段上传，返回 uploadId；contentType 决定合并后对象的 Content-Type */
+export async function initiateMultipart(env, objectKey, contentType) {
+  const headers = contentType ? { 'Content-Type': contentType } : undefined;
+  const resp = await getClient(env).fetch(r2Url(env, objectKey) + '?uploads', { method: 'POST', headers });
   if (!resp.ok) throw new Error(`multipart initiate HTTP ${resp.status}`);
   const uploadId = xmlTag(await resp.text(), 'UploadId');
   if (!uploadId) throw new Error('multipart initiate: no UploadId');

@@ -5,6 +5,7 @@
 //   管理员不限；调用失败退还额度
 // Workers AI 免费额度 10000 neurons/天（UTC 0 点重置），与账户其他 AI 调用共享
 import { getAuth } from './auth.js';
+import { consumeWindowQuota, refundWindowQuota } from './quota.js';
 
 const MODELS = {
   fast: '@cf/black-forest-labs/flux-2-klein-4b',
@@ -198,27 +199,23 @@ function todayUTC() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// 原子消费（quota.js）：检查与自增单语句完成，并发下不超限
 async function checkAndConsumeQuota(env, ip, tier) {
-  const day = todayUTC();
   const limit = DAILY_LIMIT[tier];
-  const row = await env.DB.prepare(
-    'SELECT count FROM style_quota WHERE ip = ? AND day = ? AND tier = ?'
-  ).bind(ip, day, tier).first();
-  const used = row?.count ?? 0;
-  if (used >= limit) return { allowed: false, remaining: 0 };
-  await env.DB.prepare(
-    `INSERT INTO style_quota (ip, day, tier, count, updated_at)
-     VALUES (?, ?, ?, 1, datetime('now'))
-     ON CONFLICT(ip, day, tier) DO UPDATE SET count = count + 1, updated_at = datetime('now')`
-  ).bind(ip, day, tier).run();
-  return { allowed: true, remaining: limit - used - 1 };
+  const r = await consumeWindowQuota(env, {
+    table: 'style_quota',
+    keys: [['ip', ip], ['day', todayUTC()], ['tier', tier]],
+    limit,
+    touchUpdatedAt: true,
+  });
+  return { allowed: r.allowed, remaining: r.allowed ? limit - r.count : 0 };
 }
 
-async function refundQuota(env, ip, tier) {
-  await env.DB.prepare(
-    `UPDATE style_quota SET count = MAX(count - 1, 0), updated_at = datetime('now')
-     WHERE ip = ? AND day = ? AND tier = ?`
-  ).bind(ip, todayUTC(), tier).run();
+function refundQuota(env, ip, tier) {
+  return refundWindowQuota(env, {
+    table: 'style_quota',
+    keys: [['ip', ip], ['day', todayUTC()], ['tier', tier]],
+  });
 }
 
 function dataUriToBytes(dataUri) {

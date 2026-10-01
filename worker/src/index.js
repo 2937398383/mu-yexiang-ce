@@ -1,13 +1,13 @@
 // 相册云存储 API —— Cloudflare Worker
 // 绑定：env.R2（存储）、env.DB（D1 数据库）
 // 密钥（wrangler secret）：ADMIN_PASSWORD、JWT_SECRET、R2_ACCESS_KEY_ID、R2_SECRET_ACCESS_KEY
-import { signJwt, getAuth, hashPassword } from './auth.js';
+import { signJwt, getAuth, hashPassword, timingSafeEqualStr } from './auth.js';
 import { presignR2, initiateMultipart, completeMultipart, abortMultipart } from './presign.js';
 import { handleCloudCutout } from './idphoto.js';
 import { handleStyleTransfer } from './style-transfer.js';
 import { runBackfillBatch } from './backfill.js';
 import {
-  listTrash, restorePhoto, emptyTrashBatch, purgePhotos, runScheduledCleanup,
+  listTrash, restorePhoto, emptyTrashBatch, purgePhotos, runScheduledCleanup, cleanupOrphans,
 } from './trash.js';
 import { checkLock, recordFailure, clearFailures } from './auth-guard.js';
 import { createShare, listShares, revokeShare, redeemShare,
@@ -18,6 +18,8 @@ import { backfillVideoPosters, ensureVideoProxy } from './video-thumb.js';
 import { edgeGuard } from './edge-guard.js';
 import { verifyTurnstile } from './turnstile.js';
 import { createUsageMeter, flushUsage } from './usage-meter.js';
+import { costGuardDaily, r2UploadGuard, imagesUsedThisMonth, R2_FREE_BYTES,
+         IMAGES_MONTHLY_CAP, IMAGES_MONTHLY_FREE } from './cost-guard.js';
 
 // ---------- 常量 ----------
 
@@ -31,12 +33,33 @@ const UPLOAD_URL_TTL = 3600;     // 上传用预签名 URL：1 小时（大图�
 const THUMB_CACHE = 'public, max-age=31536000, immutable';
 const ALBUM_TOKEN_TTL = 1800;    // 相册解锁 token：30 分钟
 const ADMIN_TOKEN_TTL = 43200;   // 管理员 token：12 小时
+// 上传扩展名白名单（SVG 不允许：可携带脚本，直开预签名 URL 会执行）
 const IMG_EXT_WHITELIST = new Set([
-  'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'tif', 'tiff', 'avif', 'svg',
+  'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'tif', 'tiff', 'avif',
 ]);
 // 视频有限支持：原样存储不转码；MEDIA 绑定官方仅保证 H.264 MP4
 const VIDEO_EXT_WHITELIST = new Set(['mp4', 'webm', 'mov', 'm4v']);
 const VIDEO_MAX_SIZE = 500 * 1024 * 1024; // 建议单个视频 ≤500MB
+// 扩展名 → 权威 MIME 映射（服务端按扩展名锁定 R2 对象 Content-Type，
+// 不信任客户端传入值，防止把 text/html 等存进 R2 形成存储型 XSS/钓鱼页）
+export const EXT_MIME = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+  webp: 'image/webp', bmp: 'image/bmp', heic: 'image/heic', heif: 'image/heif',
+  tif: 'image/tiff', tiff: 'image/tiff', avif: 'image/avif',
+  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', m4v: 'video/mp4',
+};
+// 上传分类判定（纯函数，便于单测）：扩展名 → {ext, kind, mime}；不在白名单返回 null（拒绝）
+export function resolveUploadExt(filename) {
+  const dot = filename.lastIndexOf('.');
+  const rawExt = dot > -1 ? filename.slice(dot + 1).toLowerCase() : '';
+  if (VIDEO_EXT_WHITELIST.has(rawExt)) {
+    return { ext: rawExt, kind: 'video', mime: EXT_MIME[rawExt] };
+  }
+  if (IMG_EXT_WHITELIST.has(rawExt)) {
+    return { ext: rawExt, kind: 'image', mime: EXT_MIME[rawExt] };
+  }
+  return null;
+}
 
 // ---------- 基础工具 ----------
 
@@ -126,11 +149,26 @@ function isAdmin(auth) {
 
 // 访问相册的条件：管理员 / 相册公开 / 持有该相册的解锁 token / 持有该相册的分享 token
 // 加密相册（encrypted=1）不可公开访问：内容为密文，需解锁后（role=album）才能取回包裹密钥与密文
-function canAccessAlbum(auth, album) {
+// 导出供单元测试做权限判定矩阵
+export function canAccessAlbum(auth, album) {
   if (isAdmin(auth)) return true;
   if (auth && auth.role === 'share' && auth.albumId === album.id) return true;
   if (!album.password_hash && !album.encrypted) return true;
   return !!auth && auth.role === 'album' && auth.albumId === album.id;
+}
+
+// 聚合接口（往年今日/地图/智能相册）的可见相册 SQL 片段。
+// 口径必须与 photoScope() 一致：加密相册一律排除（时间戳/GPS/密文缩略图也算隐私），
+// 解锁访客可看公开相册 + 自己解锁的那个。
+function albumVisibleSql(auth, admin) {
+  if (admin) return { sql: '1=1', params: [] };
+  if (auth?.role === 'album') {
+    return {
+      sql: '((a.password_hash IS NULL AND a.encrypted = 0) OR a.id = ?)',
+      params: [auth.albumId],
+    };
+  }
+  return { sql: '(a.password_hash IS NULL AND a.encrypted = 0)', params: [] };
 }
 
 // ---------- 表结构迁移（幂等，每个 isolate 只跑一次） ----------
@@ -425,7 +463,7 @@ async function handleLogin(request, env) {
   const body = await readJson(request);
   const vt = await verifyTurnstile(env, body.turnstileToken, request.headers.get('CF-Connecting-IP'));
   if (!vt.ok) return fail(vt.error, vt.status);
-  if (!body.password || body.password !== env.ADMIN_PASSWORD) {
+  if (!body.password || !(await timingSafeEqualStr(body.password, env.ADMIN_PASSWORD))) {
     const r = await recordFailure(env, 'admin', request);
     await delay(500); // 拖慢密码爆破
     // 触发锁定时同样伪装
@@ -467,7 +505,7 @@ async function handleUnlock(request, env, albumId) {
   const vt = await verifyTurnstile(env, body.turnstileToken, request.headers.get('CF-Connecting-IP'));
   if (!vt.ok) return fail(vt.error, vt.status);
   const hash = await hashPassword(String(body.password ?? ''));
-  if (hash !== album.password_hash) {
+  if (!(await timingSafeEqualStr(hash, album.password_hash))) {
     const r = await recordFailure(env, scope, request);
     await delay(800); // 6位数字空间小，必须拖慢遍历
     return fail(r.locked ? '相册密码错误' : `相册密码错误，还可尝试 ${r.remaining} 次`, 401);
@@ -661,12 +699,17 @@ async function setAllAlbumPasswords(request, env) {
   const body = await readJson(request);
   if (!isSixDigits(body.password)) return fail('密码必须是6位数字');
   const hash = await hashPassword(body.password);
-  const result = await env.DB.prepare('UPDATE album SET password_hash = ?').bind(hash).run();
+  // 加密相册走端到端口令，数字密码对其无意义，明确排除
+  const result = await env.DB.prepare(
+    'UPDATE album SET password_hash = ? WHERE encrypted = 0'
+  ).bind(hash).run();
   return json({ ok: true, updated: result.meta.changes });
 }
 
 async function clearAllAlbumPasswords(request, env) {
-  const result = await env.DB.prepare('UPDATE album SET password_hash = NULL').run();
+  const result = await env.DB.prepare(
+    'UPDATE album SET password_hash = NULL WHERE encrypted = 0'
+  ).run();
   return json({ ok: true, updated: result.meta.changes });
 }
 
@@ -849,6 +892,12 @@ async function createPhotoUpload(request, env, albumId, auth) {
   const album = await env.DB.prepare('SELECT id, encrypted FROM album WHERE id = ?').bind(albumId).first();
   if (!album) return fail('相册不存在', 404);
 
+  // 成本护栏：R2 接近免费额度上限（>9.5GB）时冻结访客上传，管理员放行但响应携带告警
+  const r2Alert = await r2UploadGuard(env);
+  if (r2Alert && auth?.role === 'collect') {
+    return fail('存储空间即将达到免费额度上限，访客上传已暂停，请联系管理员', 507);
+  }
+
   // 求照片链接访客：每链接每 IP 每小时限 50 次
   if (auth?.role === 'collect') {
     const hits = await collectHit(env, auth.shareId, request);
@@ -859,18 +908,25 @@ async function createPhotoUpload(request, env, albumId, auth) {
 
   const body = await readJson(request);
   const filename = String(body.filename ?? 'photo.jpg').slice(0, 255);
-  const contentType = String(body.contentType ?? 'application/octet-stream');
 
-  // kind 由服务端按 contentType 判定，不信前端传值
-  const isVideo = contentType.startsWith('video/');
-  const isImage = contentType.startsWith('image/');
-  if (!isImage && !isVideo) return fail('只支持上传图片或视频');
-
-  // 扩展名只取安全字符并做白名单校验
-  const dot = filename.lastIndexOf('.');
-  const rawExt = dot > -1 ? filename.slice(dot + 1).toLowerCase() : '';
-  const extWhitelist = isVideo ? VIDEO_EXT_WHITELIST : IMG_EXT_WHITELIST;
-  const ext = extWhitelist.has(rawExt) ? rawExt : 'bin';
+  // ---- 分类与 Content-Type 由服务端权威决定，不信任客户端传入的 contentType ----
+  // 非加密相册：按扩展名白名单判定（不在白名单直接拒绝，R2 对象 MIME 与扩展名绑定，
+  // 防止把 text/html 等存进 R2 形成存储型 XSS/钓鱼页）；加密相册密文无扩展名，
+  // kind 采信客户端声明（仅影响展示分类），密文对象一律 application/octet-stream
+  let isVideo = false, contentType = null, storageMime = 'application/octet-stream', ext = 'bin';
+  if (album.encrypted) {
+    const declared = String(body.contentType ?? '');
+    isVideo = declared.startsWith('video/');
+    if (!isVideo && !declared.startsWith('image/')) return fail('只支持上传图片或视频');
+    contentType = isVideo ? 'video/mp4' : 'image/jpeg';
+  } else {
+    const upload = resolveUploadExt(filename);
+    if (!upload) return fail('不支持的文件格式');
+    isVideo = upload.kind === 'video';
+    contentType = upload.mime;
+    storageMime = upload.mime;
+    ext = upload.ext;
+  }
 
   // 视频时长（前端 video.duration，服务端校验为有限整数）
   let duration = null;
@@ -983,19 +1039,25 @@ async function createPhotoUpload(request, env, albumId, auth) {
     takenMd, album.encrypted ? null : exifJson,
     encKey, encMeta).run();
 
-  const uploadUrl = await presignR2(env, 'PUT', objectKey, UPLOAD_URL_TTL);
+  // 预签名 PUT 把 Content-Type 纳入 SigV4 签名：前端必须用返回的权威 MIME 上传，
+  // 否则签名校验失败——从协议层锁死 R2 对象的 Content-Type
+  const uploadUrl = await presignR2(env, 'PUT', objectKey, UPLOAD_URL_TTL, { contentType: storageMime });
   // 大视频分段上传：前端显式请求 multipart 时发起，控制面在此，数据面直传 R2
   let uploadId = null;
   if (isVideo && body.multipart === true) {
-    uploadId = await initiateMultipart(env, objectKey);
+    uploadId = await initiateMultipart(env, objectKey, storageMime);
   }
+  const thumbMime = album.encrypted ? 'application/octet-stream'
+    : (thumbFmt === 'webp' ? 'image/webp' : 'image/jpeg');
+  const avifMime = album.encrypted ? 'application/octet-stream' : 'image/avif';
   let thumbUploadUrl = null, largeUploadUrl = null;
   let thumbAvifUploadUrl = null, largeAvifUploadUrl = null;
-  const putKeys = [];
-  if (smallKey) putKeys.push(smallKey, largeKey);
-  if (avifSmallKey) putKeys.push(avifSmallKey, avifLargeKey);
-  if (putKeys.length) {
-    const urls = await Promise.all(putKeys.map((k) => presignR2(env, 'PUT', k, UPLOAD_URL_TTL)));
+  const putJobs = [];
+  if (smallKey) putJobs.push([smallKey, thumbMime], [largeKey, thumbMime]);
+  if (avifSmallKey) putJobs.push([avifSmallKey, avifMime], [avifLargeKey, avifMime]);
+  if (putJobs.length) {
+    const urls = await Promise.all(
+      putJobs.map(([k, m]) => presignR2(env, 'PUT', k, UPLOAD_URL_TTL, { contentType: m })));
     let i = 0;
     if (smallKey) { thumbUploadUrl = urls[i++]; largeUploadUrl = urls[i++]; }
     if (avifSmallKey) { thumbAvifUploadUrl = urls[i++]; largeAvifUploadUrl = urls[i++]; }
@@ -1005,8 +1067,12 @@ async function createPhotoUpload(request, env, albumId, auth) {
     multipart: !!uploadId, uploadId,
     uploadUrl: uploadId ? null : uploadUrl,
     thumbUploadUrl, largeUploadUrl, thumbAvifUploadUrl, largeAvifUploadUrl,
+    uploadContentType: storageMime,
+    thumbUploadContentType: smallKey ? thumbMime : null,
+    avifUploadContentType: avifSmallKey ? avifMime : null,
     objectKey, smallKey, largeKey, avifSmallKey, avifLargeKey,
     uploadUrlExpiresIn: UPLOAD_URL_TTL,
+    ...(r2Alert ? { r2Warning: '存储空间即将达到免费额度上限（>9.5GB），请尽快清理' } : {}),
   }, 201);
 }
 
@@ -1037,19 +1103,35 @@ async function finalizePhoto(env, photoId, ctx, { phash = null, thumbHash = null
   const obj = await env.R2.head(photo.object_key);
   if (!obj) return { missing: true };
 
-  // 缩略图 best-effort 校验：若小图没传成功，则清空缩略图字段，前端自动降级原图
+  // Content-Type 兜底校验：R2 实际 MIME 必须与扩展名的权威映射一致
+  // （预签名已把 Content-Type 纳入签名，此处防绕过/历史误传对象入库；
+  //   加密相册密文为 application/octet-stream，不在扩展名映射表内则跳过）
+  const expectMime = EXT_MIME[photo.object_key.split('.').pop()?.toLowerCase() ?? ''];
+  const actualMime = (obj.httpContentType ?? '').split(';')[0].trim().toLowerCase();
+  if (expectMime && actualMime && actualMime !== expectMime
+    && actualMime !== 'application/octet-stream') {
+    await env.R2.delete(photo.object_key).catch(() => {});
+    return { mismatch: true };
+  }
+
+  // 缩略图 best-effort 校验：若小图没传成功（或 MIME 异常）则清空缩略图字段，前端自动降级原图
+  const thumbMimeOk = (httpContentType) => {
+    const m = (httpContentType ?? '').split(';')[0].trim().toLowerCase();
+    return !m || m.startsWith('image/') || m === 'application/octet-stream';
+  };
   let thumbKey = photo.thumb_key, largeKey = photo.large_key;
   if (thumbKey) {
     const t = await env.R2.head(thumbKey);
-    if (!t) {
+    if (!t || !thumbMimeOk(t.httpContentType)) {
       thumbKey = null;
       if (largeKey && !(await env.R2.head(largeKey))) largeKey = null;
     }
   }
-  // AVIF 缩略图 best-effort：主缩略图缺失时一并清理；AVIF 单独缺失则降级 WebP
+  // AVIF 缩略图 best-effort：主缩略图缺失时一并清理；AVIF 单独缺失/异常则降级 WebP
   let thumbAvifKey = photo.thumb_avif_key, largeAvifKey = photo.large_avif_key;
   if (thumbAvifKey) {
-    if (!thumbKey || !(await env.R2.head(thumbAvifKey))) {
+    const a = thumbKey ? await env.R2.head(thumbAvifKey) : null;
+    if (!a || !thumbMimeOk(a.httpContentType)) {
       thumbAvifKey = null;
       if (largeAvifKey && !(await env.R2.head(largeAvifKey))) largeAvifKey = null;
     }
@@ -1083,13 +1165,14 @@ async function confirmPhoto(request, env, photoId, ctx) {
   const r = await finalizePhoto(env, photoId, ctx, { phash, thumbHash });
   if (r.notFound) return fail('照片记录不存在', 404);
   if (r.missing) return fail('R2 中未找到文件，请先完成直传', 409);
+  if (r.mismatch) return fail('文件内容类型与声明不符，已拒绝入库', 415);
   return json({ ok: true, photo: { id: photoId, size: r.size } });
 }
 
 // 分段上传：换取单个分段的预签名 PUT URL（uploadId 由 createPhotoUpload 发起）
 async function multipartPartUrl(request, env, photoId) {
   const photo = await env.DB.prepare(
-    "SELECT id, album_id, object_key, status FROM photo WHERE id = ?"
+    "SELECT id, album_id, object_key, content_type, status FROM photo WHERE id = ?"
   ).bind(photoId).first();
   if (!photo) return fail('照片记录不存在', 404);
   if (photo.status !== 'uploading') return fail('该照片无需继续上传', 409);
@@ -1101,9 +1184,10 @@ async function multipartPartUrl(request, env, photoId) {
     return fail('无效的分段参数');
   }
   const url = await presignR2(env, 'PUT', photo.object_key, UPLOAD_URL_TTL, {
+    contentType: photo.content_type ?? 'application/octet-stream',
     query: { partNumber, uploadId },
   });
-  return json({ ok: true, url, expiresIn: UPLOAD_URL_TTL });
+  return json({ ok: true, url, contentType: photo.content_type ?? 'application/octet-stream', expiresIn: UPLOAD_URL_TTL });
 }
 
 // 分段上传完成：合并分段 → 校验 → 收尾（与直传 confirm 同逻辑）
@@ -1144,6 +1228,7 @@ async function multipartComplete(request, env, photoId, ctx) {
   const r = await finalizePhoto(env, photoId, ctx, { phash, thumbHash });
   if (r.notFound) return fail('照片记录不存在', 404);
   if (r.missing) return fail('合并后对象校验失败，请重试', 409);
+  if (r.mismatch) return fail('文件内容类型与声明不符，已拒绝入库', 415);
   return json({ ok: true, photo: { id: photoId, size: r.size } });
 }
 
@@ -1166,15 +1251,17 @@ async function multipartAbort(request, env, photoId) {
 // 按需换取新鲜的预签名 URL（列表里的 URL 可能已过期）
 async function getPhotoUrl(request, env, photoId) {
   const row = await env.DB.prepare(
-    `SELECT p.object_key, p.proxy_key, a.id AS album_id, a.password_hash
+    `SELECT p.object_key, p.proxy_key, a.id AS album_id, a.password_hash, a.encrypted
      FROM photo p JOIN album a ON a.id = p.album_id
      WHERE p.id = ? AND p.status = 'ready'`
   ).bind(photoId).first();
   if (!row) return fail('照片不存在', 404);
 
+  // 权限判定必须携带 encrypted（与 listPhotos 同口径）：加密相册不可未解锁访问，
+  // 否则 password_hash 为 NULL 的加密相册会被误判为公开，匿名即可换取密文 URL
   const auth = await getAuth(request, env);
-  if (!canAccessAlbum(auth, { id: row.album_id, password_hash: row.password_hash })) {
-    return fail('需要相册密码', 403);
+  if (!canAccessAlbum(auth, { id: row.album_id, password_hash: row.password_hash, encrypted: row.encrypted })) {
+    return fail(row.encrypted ? '需要相册解锁' : '需要相册密码', 403);
   }
   // 单张分享 token 不得换取其他照片
   if (auth?.role === 'share' && auth.photoId && photoId !== auth.photoId) {
@@ -1187,7 +1274,9 @@ async function getPhotoUrl(request, env, photoId) {
 
 async function deletePhoto(request, env, photoId) {
   const photo = await env.DB.prepare(
-    'SELECT id, album_id, object_key, thumb_key, large_key, status FROM photo WHERE id = ?'
+    `SELECT id, album_id, object_key, thumb_key, large_key,
+            thumb_avif_key, large_avif_key, proxy_key, status
+       FROM photo WHERE id = ?`
   ).bind(photoId).first();
   if (!photo) return fail('照片记录不存在', 404);
   if (photo.status === 'trashed') {
@@ -1228,7 +1317,8 @@ async function batchPhotos(request, env) {
 
   const placeholders = ids.map(() => '?').join(',');
   const { results } = await env.DB.prepare(
-    `SELECT id, album_id, filename, object_key, thumb_key, large_key, status
+    `SELECT id, album_id, filename, object_key, thumb_key, large_key,
+            thumb_avif_key, large_avif_key, proxy_key, status
        FROM photo WHERE id IN (${placeholders})`
   ).bind(...ids).all();
   if (results.length !== ids.length) return fail('部分照片不存在', 404);
@@ -1255,23 +1345,27 @@ async function batchPhotos(request, env) {
     if (!target) return fail('目标相册不存在', 404);
 
     let moved = 0, failed = 0, skipped = 0;
+    // 全部衍生对象 key 都要跟着 rebase（漏掉 AVIF/proxy 会在旧前缀留下孤儿对象）
+    const MOVE_KEY_COLS = ['object_key', 'thumb_key', 'large_key', 'thumb_avif_key', 'large_avif_key', 'proxy_key'];
     for (const id of ids) {
       const r = byId.get(id);
       if (r.album_id === targetAlbumId) { skipped++; continue; }
       try {
         const rebase = (k) =>
           k.replace(`albums/${r.album_id}/`, `albums/${targetAlbumId}/`);
-        const newObjectKey = rebase(r.object_key);
-        const newThumbKey = r.thumb_key ? rebase(r.thumb_key) : null;
-        const newLargeKey = r.large_key ? rebase(r.large_key) : null;
-        const pairs = [[r.object_key, newObjectKey]];
-        if (r.thumb_key) pairs.push([r.thumb_key, newThumbKey]);
-        if (r.large_key) pairs.push([r.large_key, newLargeKey]);
+        const pairs = [];
+        const updates = {};
+        for (const col of MOVE_KEY_COLS) {
+          if (!r[col]) continue;
+          const dst = rebase(r[col]);
+          pairs.push([r[col], dst]);
+          updates[col] = dst;
+        }
         // R2 服务端 copy 成功后再改元数据，最后删旧对象（中途失败旧对象仍在）
         for (const [src, dst] of pairs) await env.R2.copy(src, dst);
         await env.DB.prepare(
-          'UPDATE photo SET album_id = ?, object_key = ?, thumb_key = ?, large_key = ? WHERE id = ?'
-        ).bind(targetAlbumId, newObjectKey, newThumbKey, newLargeKey, r.id).run();
+          `UPDATE photo SET album_id = ?, ${MOVE_KEY_COLS.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`
+        ).bind(targetAlbumId, ...MOVE_KEY_COLS.map((c) => updates[c] ?? null), r.id).run();
         for (const [src] of pairs) await env.R2.delete(src);
         moved++;
       } catch (e) {
@@ -1309,11 +1403,10 @@ async function batchPhotos(request, env) {
 async function onThisDay(request, env) {
   const auth = await getAuth(request, env);
   const admin = isAdmin(auth);
-  // 可见相册条件：公开相册 / 管理员全部 / 已解锁的那个相册
-  const albumVisible = admin ? '1=1'
-    : auth?.role === 'album' ? '(a.password_hash IS NULL OR a.id = ?)'
-    : 'a.password_hash IS NULL';
-  const params = auth?.role === 'album' && !admin ? [auth.albumId] : [];
+  // 可见相册条件：公开相册（加密相册一律排除）/ 管理员全部 / 已解锁的那个相册
+  const visible = albumVisibleSql(auth, admin);
+  const albumVisible = visible.sql;
+  const params = [...visible.params];
 
   const todayMd = new Date().toISOString().slice(5, 10); // MM-DD
   const { results } = await env.DB.prepare(
@@ -1369,12 +1462,10 @@ async function geoPhotos(request, env) {
   const admin = isAdmin(auth);
   const albumId = reqUrl.searchParams.get('albumId');
 
-  // 可见相册条件
-  const albumVisible = admin ? '1=1'
-    : auth?.role === 'album' ? '(a.password_hash IS NULL OR a.id = ?)'
-    : 'a.password_hash IS NULL';
-  const params = [];
-  if (!admin && auth?.role === 'album') params.push(auth.albumId);
+  // 可见相册条件（加密相册一律排除）
+  const visible = albumVisibleSql(auth, admin);
+  const albumVisible = visible.sql;
+  const params = [...visible.params];
 
   const albumFilter = albumId ? 'AND p.album_id = ?' : '';
   if (albumId) params.push(albumId);
@@ -1489,7 +1580,7 @@ async function adminStats(request, env) {
       ORDER BY bytes DESC`
   ).all();
 
-  const R2_FREE_BYTES = 10 * 1024 * 1024 * 1024; // Cloudflare R2 免费 10GB
+  // R2 免费额度常量统一来自 cost-guard（护栏与展示同源，改一处即可）
   const usedBytes = totals.bytes;
   const remainBytes = Math.max(0, R2_FREE_BYTES - usedBytes);
   const quota = {
@@ -1523,6 +1614,17 @@ async function adminStats(request, env) {
     writeLimit: D1_WRITE_DAY,
   };
 
+  // 成本护栏：Images 月度用量（免费 5000 次/月，熔断线 4500）
+  const imagesUsed = await imagesUsedThisMonth(env);
+  const guard = {
+    r2Alert: await r2UploadGuard(env),
+    images: {
+      used: imagesUsed,
+      cap: IMAGES_MONTHLY_CAP,
+      free: IMAGES_MONTHLY_FREE,
+    },
+  };
+
   return json({
     ok: true,
     totals: {
@@ -1536,6 +1638,7 @@ async function adminStats(request, env) {
     },
     quota,
     d1,
+    guard,
     byAlbum: results.map((r) => ({
       albumId: r.id, name: r.name,
       photos: r.photos, videos: r.videos, bytes: r.bytes,
@@ -1930,12 +2033,10 @@ async function smartEvents(request, env) {
   const auth = await getAuth(request, env);
   const admin = isAdmin(auth);
   const albumIdParam = u.searchParams.get('albumId') || '';
-  // 可见相册条件（与往年今日/地图一致）：公开相册 / 管理员全部 / 已解锁的那个相册
-  const albumVisible = admin ? '1=1'
-    : auth?.role === 'album' ? '(a.password_hash IS NULL OR a.id = ?)'
-    : 'a.password_hash IS NULL';
-  const params = auth?.role === 'album' && !admin ? [auth.albumId] : [];
-  const conds = [`p.status = 'ready'`, albumVisible];
+  // 可见相册条件（与往年今日/地图一致，加密相册一律排除）
+  const visible = albumVisibleSql(auth, admin);
+  const params = [...visible.params];
+  const conds = [`p.status = 'ready'`, visible.sql];
   if (albumIdParam) { conds.push('p.album_id = ?'); params.push(albumIdParam); }
 
   const { results } = await env.DB.prepare(
@@ -1990,9 +2091,7 @@ async function smartPhotos(request, env) {
   const auth = await getAuth(request, env);
   const admin = isAdmin(auth);
   const albumIdParam = u.searchParams.get('albumId') || '';
-  const albumVisible = admin ? '1=1'
-    : auth?.role === 'album' ? '(a.password_hash IS NULL OR a.id = ?)'
-    : 'a.password_hash IS NULL';
+  const visible = albumVisibleSql(auth, admin);
 
   const start = u.searchParams.get('start') || '';
   const end = u.searchParams.get('end') || '';
@@ -2000,9 +2099,8 @@ async function smartPhotos(request, env) {
     return fail('缺少时间范围', 400);
   }
 
-  const conds = [`p.status = 'ready'`, albumVisible];
-  const params = [];
-  if (auth?.role === 'album' && !admin) params.push(auth.albumId);
+  const conds = [`p.status = 'ready'`, visible.sql];
+  const params = [...visible.params];
   // 与聚类口径一致：按 COALESCE(taken_at, created_at) 过滤
   conds.push(`COALESCE(p.taken_at, p.created_at) >= ? AND COALESCE(p.taken_at, p.created_at) <= ?`);
   params.push(start, end);
@@ -2040,7 +2138,8 @@ async function route(request, env, ctx) {
 
   const url = new URL(request.url);
   const seg = url.pathname.split('/').filter(Boolean);
-  const method = request.method;
+  // HEAD 按 GET 路由（OG 爬虫/健康检查常用；Response 会自动省去 body）
+  const method = request.method === 'HEAD' ? 'GET' : request.method;
   const auth = await getAuth(request, env);
   const adminOnly = () => (isAdmin(auth) ? null : fail('需要管理员登录', 401));
   // 内容级权限：管理员 / 相册解锁访客 / 求照片链接访客（仅可上传）
@@ -2295,6 +2394,12 @@ async function route(request, env, ctx) {
     const result = await backfillVideoPosters(env, { limit: opts.limit });
     return json({ ok: true, ...result });
   }
+  // R2 孤儿对象一键清理（管理员）：删除 photo 表无引用的历史残留，直接降低 R2 计费基数
+  if (method === 'POST' && url.pathname === '/api/admin/cleanup-orphans') {
+    const deny = adminOnly(); if (deny) return deny;
+    const r = await cleanupOrphans(env);
+    return json({ ok: true, scanned: r.scanned, deleted: r.deleted, hasMore: r.hasMore });
+  }
 
   return fail('接口不存在', 404);
 }
@@ -2324,6 +2429,8 @@ export default {
     console.log('scheduled fired:', controller.cron);
     const { meteredEnv, counters } = createUsageMeter(env);
     const summary = await runScheduledCleanup(meteredEnv);
+    // 成本护栏：检查 R2 用量是否逼近免费额度，写/清告警标记
+    summary.costGuard = await costGuardDaily(env);
     flushUsage(env, counters, controller);
     console.log('scheduled summary:', JSON.stringify(summary));
   },

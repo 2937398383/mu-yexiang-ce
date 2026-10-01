@@ -4,7 +4,7 @@
 //   photo   单张照片只读（role:'share' + photoId，listPhotos 自动收敛为一张）
 //   collect 求照片：访客可匿名上传，不能浏览（role:'collect'，每链接每 IP 每小时 50 次）
 // token 为 HS256 JWT，最长 24 小时；可设访问密码（防链接外泄）
-import { signJwt, hashSharePassword } from './auth.js';
+import { signJwt, hashSharePassword, timingSafeEqualStr } from './auth.js';
 import { checkLock, recordFailure, clearFailures } from './auth-guard.js';
 
 const SHARE_TOKEN_TTL = 24 * 3600; // 换取的访问 token 最长 24h
@@ -134,7 +134,7 @@ export async function redeemShare(request, env, shareId) {
     }
     const body = await request.json().catch(() => ({}));
     const hash = await hashSharePassword(String(body.password ?? ''));
-    if (hash !== share.password_hash) {
+    if (!(await timingSafeEqualStr(hash, share.password_hash))) {
       const r = await recordFailure(env, scope, request);
       return fail(r.locked ? '密码错误或尝试次数过多' : '密码错误', 401,
         { needsPassword: true, kind: share.kind });

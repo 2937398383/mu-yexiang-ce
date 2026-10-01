@@ -2,8 +2,8 @@
 // 在业务路由之前执行。限流依赖 D1，故障时降级放行（不因风控故障阻断正常服务）。
 
 // ---------- 方法白名单 ----------
-
-const ALLOWED_METHODS = new Set(['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS']);
+// HEAD：OG 爬虫/CDN 健康检查常用，与 GET 同等放行
+const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'PATCH', 'DELETE', 'OPTIONS']);
 
 // ---------- 扫描/利用路径 ----------
 
@@ -20,6 +20,38 @@ const BAD_UA_RE =
 
 const GLOBAL_RATE = 120;   // 每 IP 每分钟最多 120 次 API 请求
 
+// 幂等读（GET/HEAD）走 isolate 内存窗口计数：尽力而为的软限流，
+// 每个请求不再写 D1（免费层写配额 10 万行/天，此前读请求也各写一行是最大消耗者）
+const memHits = new Map(); // minuteKey -> Map(ip -> count)
+let memSweepMinute = '';
+
+function memRateLimited(ip) {
+  const mk = minuteKey();
+  if (mk !== memSweepMinute) {
+    memSweepMinute = mk;
+    memHits.clear(); // 窗口整体过期：上一分钟的计数即废弃
+  }
+  let win = memHits.get(mk);
+  if (!win) { win = new Map(); memHits.set(mk, win); }
+  const n = (win.get(ip) ?? 0) + 1;
+  win.set(ip, n);
+  return n > GLOBAL_RATE;
+}
+
+// 写操作走 D1 原子计数（跨 isolate 一致，写操作频次远低于读，D1 写压力可控）
+async function rateLimited(ip, env) {
+  try {
+    const row = await env.DB.prepare(
+      `INSERT INTO rate_event (ip, minute, count) VALUES (?, ?, 1)
+       ON CONFLICT(ip, minute) DO UPDATE SET count = rate_event.count + 1
+       RETURNING count`
+    ).bind(ip, minuteKey()).first();
+    return (row?.count ?? 0) > GLOBAL_RATE;
+  } catch {
+    return false; // D1 故障降级放行
+  }
+}
+
 function clientIp(request) {
   return request.headers.get('CF-Connecting-IP') || 'unknown';
 }
@@ -28,19 +60,6 @@ function minuteKey() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}`;
-}
-
-async function rateLimited(request, env) {
-  try {
-    const row = await env.DB.prepare(
-      `INSERT INTO rate_event (ip, minute, count) VALUES (?, ?, 1)
-       ON CONFLICT(ip, minute) DO UPDATE SET count = rate_event.count + 1
-       RETURNING count`
-    ).bind(clientIp(request), minuteKey()).first();
-    return (row?.count ?? 0) > GLOBAL_RATE;
-  } catch {
-    return false; // D1 故障降级放行
-  }
 }
 
 /**
@@ -64,7 +83,11 @@ export async function edgeGuard(request, env) {
     });
   }
 
-  if (await rateLimited(request, env)) {
+  const ip = clientIp(request);
+  const limited = (request.method === 'GET' || request.method === 'HEAD')
+    ? memRateLimited(ip)
+    : await rateLimited(ip, env);
+  if (limited) {
     return new Response(JSON.stringify({ ok: false, error: '请求过于频繁，请稍后再试' }), {
       status: 429,
       headers: { 'Content-Type': 'application/json; charset=utf-8', 'Retry-After': '60' },
