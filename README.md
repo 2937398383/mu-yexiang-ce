@@ -14,7 +14,7 @@
 - **照片收藏**：⭐ 收藏标记 + 「只看收藏」筛选；大图查看器可写**照片备注**（≤500 字）
 - **相册封面** / 相册内**时间线分组**
 - **往年今日**：按拍摄日期回顾历史照片
-- **回收站**：软删除 30 天内可恢复，Cron 自动真删
+- **回收站**：软删除 10 天内可恢复（超量自动淘汰最早删除的），Cron 自动真删
 - **有限视频支持**：mp4/webm/mov/m4v 原样上传（≤500MB，不转码），前端 canvas 抽帧，Worker Media 绑定兜底
 - **多选批量操作**：批量删除、移动相册、规则重命名（管理员）
 - **PWA**：可添加到主屏，支持拖拽 / 粘贴上传，2–3 路文件级并发
@@ -69,15 +69,19 @@ D1 置为 ready，异步 AI 打标
 └── worker/
     ├── src/
     │   ├── index.js         # Worker 入口、路由、ensurePhotoSchema 自动迁移
-    │   ├── presign.js       # R2 SigV4 预签名（零 SDK）
-    │   ├── auth.js          # JWT / 密码哈希
-    │   ├── auth-guard.js    # 解锁态与失败锁定
+    │   ├── presign.js       # R2 SigV4 预签名（零 SDK，Content-Type 纳入签名）
+    │   ├── auth.js          # JWT / 密码哈希 / 常量时间比较
+    │   ├── auth-guard.js    # 解锁态与失败锁定（原子计数）
+    │   ├── quota.js         # 原子配额/计数工具（单语句「检查+自增」）
+    │   ├── cost-guard.js    # 成本护栏（R2/Images 免费额度监控与熔断）
+    │   ├── edge-guard.js    # 边缘防护（方法白名单/扫描拦截/内存+D1 分级限流）
     │   ├── share.js         # 分享链接（album/photo/collect）
     │   ├── ai-tags.js       # AI 自动标签
     │   ├── video-thumb.js   # Media 绑定视频抽帧
-    │   ├── trash.js         # 回收站 / Cron 清理
+    │   ├── trash.js         # 回收站 / Cron 清理 / R2 孤儿清理
     │   ├── idphoto.js       # 云端证件照接口
-    │   └── style-transfer.js# 云端换风格接口
+    │   ├── style-transfer.js# 云端换风格接口
+    │   └── backfill.js      # 缩略图回填
     ├── schema.sql           # D1 参考建表脚本
     └── wrangler.toml
 ```
@@ -122,9 +126,28 @@ npx wrangler d1 execute album-db --remote --file=./schema.sql
 
 ## 安全说明
 - CORS 已收紧为域名白名单
-- 管理员登录、相册解锁、分享解锁均有按 IP 失败计数与临时锁定
+- 管理员登录、相册解锁、分享解锁均有按 IP 失败计数与临时锁定（原子计数，并发下不失效）
+- 密码比较使用常量时间算法（先 SHA-256 归一化再用 `timingSafeEqual`），无时序侧信道
+- 上传扩展名白名单严格校验（不含 SVG），R2 对象 Content-Type 由服务端按扩展名锁定（纳入 SigV4 签名 + confirm 兜底校验），杜绝存储型 XSS
+- 加密相册在所有接口（含往年今日/地图/智能相册等聚合视图）一律排除，未解锁不可见
 - 500 错误对客户端脱敏，细节仅写日志
 - 加密相册不向前端返回封面签名 URL
+- 更换管理员密码：`wrangler secret put ADMIN_PASSWORD`，旧 token 最长 12 小时后自然过期
+
+## 成本护栏（免费额度内运行）
+- **R2**：每日 Cron 检查用量，超过 9.5GB（免费 10GB 的 95%）自动冻结访客上传并在统计页告警
+- **Images**：月度用量计量（app_meta 原子计数），达到 4500 次（免费 5000 的 90%）熔断云端抠图与缩略图回填
+- **Workers AI**：全站每日 200 张打标限额 + 换风格按档位限额，天然在 10000 neurons/天内
+- **D1**：读请求限流走内存窗口（不写 D1），写操作原子计数，远低于 10 万行/天
+- 统计页（管理员）实时显示各资源免费额度进度条，支持一键清理 R2 孤儿文件
+
+## 测试与部署
+```bash
+cd worker
+npm test            # node --test：加密协议 roundtrip、上传白名单、访问控制矩阵
+npx wrangler deploy # 部署 Worker
+```
+Pages 部署后把 `web/config.js` 的 API 地址指向 Worker 域名。
 
 ## 许可证
 
