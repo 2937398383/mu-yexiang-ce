@@ -403,28 +403,32 @@ async function runSchemaMigration(env) {
   ).run();
   await safeExec('idx_photo_tag_tag',
     `CREATE INDEX IF NOT EXISTS idx_photo_tag_tag ON photo_tag(tag)`);
-  // 回填：从现有 photo.tags JSON 同步到 photo_tag（仅补充缺失项，幂等）
+  // 回填：仅 photo_tag 为空时执行一次（json_each 全表扫描是冷启动主开销之一；
+  // 此后打标路径同步维护 photo_tag（ai-tags.js），日常冷启动直接跳过）
   try {
-    await env.DB.prepare(
-      `INSERT OR IGNORE INTO photo_tag(photo_id, tag)
-       SELECT p.id, je.value
-         FROM photo p, json_each(p.tags) je
-        WHERE p.tags IS NOT NULL AND json_valid(p.tags) AND je.type = 'text'`
-    ).run();
+    const hasAny = await env.DB.prepare('SELECT 1 FROM photo_tag LIMIT 1').first();
+    if (!hasAny) {
+      await env.DB.prepare(
+        `INSERT OR IGNORE INTO photo_tag(photo_id, tag)
+         SELECT p.id, je.value
+           FROM photo p, json_each(p.tags) je
+          WHERE p.tags IS NOT NULL AND json_valid(p.tags) AND je.type = 'text'`
+      ).run();
+    }
   } catch { /* 回填失败不影响启动 */ }
   // 拍摄月日（MM-DD）：往年今日查询可走索引，避免 strftime 全表扫
   if (!existing.has('taken_md')) {
     await addCol('photo', 'taken_md', 'TEXT');
-  }
-  // 幂等回填：无 EXIF 拍摄日期的照片按上传月日（与旧 strftime COALESCE 口径一致）
-  // 大表 UPDATE 可能触发 D1 CPU 超时，失败不阻断启动（taken_md 仅用于往年今日索引优化）
-  try {
-    await env.DB.prepare(
-      `UPDATE photo SET taken_md = substr(COALESCE(taken_at, created_at), 6, 5)
-        WHERE taken_md IS NULL AND COALESCE(taken_at, created_at) IS NOT NULL`
-    ).run();
-  } catch (e) {
-    console.log('taken_md backfill failed (non-fatal):', e?.message ?? String(e));
+    // 仅新建列时一次性回填历史数据（大表 UPDATE 是冷启动延迟主因；
+    // 日常缺失补齐由每日 Cron 兜底，见 trash.js runScheduledCleanup）
+    try {
+      await env.DB.prepare(
+        `UPDATE photo SET taken_md = substr(COALESCE(taken_at, created_at), 6, 5)
+          WHERE taken_md IS NULL AND COALESCE(taken_at, created_at) IS NOT NULL`
+      ).run();
+    } catch (e) {
+      console.log('taken_md backfill failed (non-fatal):', e?.message ?? String(e));
+    }
   }
   await safeExec('idx_photo_taken_md',
     `CREATE INDEX IF NOT EXISTS idx_photo_taken_md ON photo(taken_md, status)`);
@@ -535,11 +539,12 @@ async function listAlbums(request, env) {
 
   // ETag：所有相册版本号的最大值（任何相册变更都会反映）
   // 时间桶：预签名 URL 15 分钟过期，桶翻转后强制 200 返回新鲜 URL
+  // 身份位：响应内容随管理员/访客不同（封面签名/lockedCover），ETag 必须区分防 304 串身份
   const verRow = await env.DB.prepare(
     'SELECT COALESCE(MAX(v), 0) AS m FROM album_version'
   ).first();
   const urlBucket = Math.floor(Date.now() / 1000 / PHOTO_URL_TTL);
-  const etag = `W/"albums-v${verRow?.m ?? 0}-t${urlBucket}"`;
+  const etag = `W/"albums-v${verRow?.m ?? 0}-t${urlBucket}-a${admin ? 1 : 0}"`;
   if (request.headers.get('If-None-Match') === etag) {
     return new Response(null, {
       status: 304,
@@ -566,17 +571,21 @@ async function listAlbums(request, env) {
      FROM album a ORDER BY a.created_at DESC`
   ).all();
 
-  const albums = [];
-  for (const row of results) {
-    const v = albumView(row);
+  // 封面签名并行（相册数量可能上百，串行 await 累积明显延迟）
+  const coverUrls = await Promise.all(results.map((row) => {
     // 加密/加锁相册对非管理员不签真实封面（列表无需解锁，防止内容泄露）
     const showReal = admin || (!row.password_hash && !row.encrypted);
-    v.coverUrl = showReal && row.cover_key
-      ? await presignR2(env, 'GET', row.cover_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null;
+    return showReal && row.cover_key
+      ? presignR2(env, 'GET', row.cover_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE })
+      : null;
+  }));
+  const albums = results.map((row, idx) => {
+    const v = albumView(row);
+    v.coverUrl = coverUrls[idx];
     v.coverIsAuto = !row.cover_photo_id || row.cover_id !== row.cover_photo_id;
     v.lockedCover = (!!row.password_hash || !!row.encrypted) && !admin; // 前端显示锁形占位
-    albums.push(v);
-  }
+    return v;
+  });
   return json({
     ok: true,
     isAdmin: admin,
@@ -735,19 +744,21 @@ function decodeCursor(cursor) {
 const SORT_EXPR = `COALESCE(taken_at, created_at)`; // 排序键，与 idx_photo_sort 表达式一致
 
 // 预签名缩略图/大图 URL 集合（含 AVIF 变体；无 AVIF 时对应字段为 null，前端降级 WebP/JPEG）
+// 签名是纯 CPU 操作（HMAC），5 个并行消除串行 await 的排队开销
 async function presignMedia(env, r) {
   const thumbKey = r.thumb_key ?? r.object_key;
-  return {
-    thumbUrl: await presignR2(env, 'GET', thumbKey, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }),
-    thumbAvifUrl: r.thumb_avif_key
-      ? await presignR2(env, 'GET', r.thumb_avif_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
-    largeUrl: r.large_key
-      ? await presignR2(env, 'GET', r.large_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
-    largeAvifUrl: r.large_avif_key
-      ? await presignR2(env, 'GET', r.large_avif_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
-    proxyUrl: r.proxy_key
-      ? await presignR2(env, 'GET', r.proxy_key, PHOTO_URL_TTL) : null,
-  };
+  const [thumbUrl, thumbAvifUrl, largeUrl, largeAvifUrl, proxyUrl] = await Promise.all([
+    presignR2(env, 'GET', thumbKey, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }),
+    r.thumb_avif_key
+      ? presignR2(env, 'GET', r.thumb_avif_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
+    r.large_key
+      ? presignR2(env, 'GET', r.large_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
+    r.large_avif_key
+      ? presignR2(env, 'GET', r.large_avif_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
+    r.proxy_key
+      ? presignR2(env, 'GET', r.proxy_key, PHOTO_URL_TTL) : null,
+  ]);
+  return { thumbUrl, thumbAvifUrl, largeUrl, largeAvifUrl, proxyUrl };
 }
 
 async function listPhotos(request, env, albumId) {
@@ -778,11 +789,11 @@ async function listPhotos(request, env, albumId) {
   const missingOnly = reqUrl.searchParams.get('missing') === '1';
 
   // ETag：基于相册版本号（任何变更自增），命中则 304 省掉主查询
-  // 时间桶保证预签名 URL 过期后强制 200 刷新（URL TTL 15 分钟）
+  // 时间桶保证预签名 URL 过期后强制 200 刷新（URL TTL 15 分钟）；身份位防 304 串身份
   const version = await getAlbumVersion(env, albumId);
   const cursorKey = cursorParam ? cursorParam.slice(0, 16) : '0';
   const urlBucket = Math.floor(Date.now() / 1000 / PHOTO_URL_TTL);
-  const etag = `W/"v${version}-${cursorKey}-${limit}-${missingOnly ? 1 : 0}-t${urlBucket}"`;
+  const etag = `W/"v${version}-${cursorKey}-${limit}-${missingOnly ? 1 : 0}-t${urlBucket}-a${isAdmin(auth) ? 1 : 0}"`;
   if (request.headers.get('If-None-Match') === etag) {
     return new Response(null, {
       status: 304,
@@ -829,8 +840,11 @@ async function listPhotos(request, env, albumId) {
   const hasMore = results.length > limit;
   const page = hasMore ? results.slice(0, limit) : results;
 
+  // 行级签名并行（每页 60 张 × 最多 5 个签名，串行 await 是列表延迟的主要构成）
+  const mediaList = await Promise.all(page.map((r) => presignMedia(env, r)));
   const photos = [];
-  for (const r of page) {
+  for (let idx = 0; idx < page.length; idx++) {
+    const r = page[idx];
     let tags = [];
     try { tags = r.tags ? JSON.parse(r.tags) : []; } catch { tags = []; }
     // 加密相册：明文字段一律不下发（文件名/相机/标签/描述/备注/EXIF/缩略哈希），改下发密文元数据与包裹的文件密钥
@@ -855,20 +869,24 @@ async function listPhotos(request, env, albumId) {
       encrypted: isEnc,
       encKey: isEnc ? r.enc_key : null,
       encMeta: isEnc ? r.enc_meta : null,
-      ...(await presignMedia(env, r)),
+      ...mediaList[idx],
     });
   }
 
-  // 缺缩略图的照片数（管理员据此显示回填按钮）
-  const missingRow = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM photo
-      WHERE album_id = ? AND status = 'ready' AND thumb_key IS NULL`
-  ).bind(albumId).first();
-  // 未打 AI 标签的照片数（管理员据此显示补打按钮）
-  const untaggedRow = await env.DB.prepare(
-    `SELECT COUNT(*) AS n FROM photo
-      WHERE album_id = ? AND status = 'ready' AND tags IS NULL`
-  ).bind(albumId).first();
+  // 缺缩略图/未打标计数仅管理员需要（前端据此显示回填/补打按钮），访客省 2 次全相册 COUNT
+  let missingThumbs = 0, untaggedCount = 0;
+  if (isAdmin(auth)) {
+    const missingRow = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM photo
+        WHERE album_id = ? AND status = 'ready' AND thumb_key IS NULL`
+    ).bind(albumId).first();
+    const untaggedRow = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM photo
+        WHERE album_id = ? AND status = 'ready' AND tags IS NULL`
+    ).bind(albumId).first();
+    missingThumbs = missingRow?.n ?? 0;
+    untaggedCount = untaggedRow?.n ?? 0;
+  }
 
   return json({
     ok: true,
@@ -880,8 +898,8 @@ async function listPhotos(request, env, albumId) {
       coverPhotoId: album.cover_photo_id ?? null,
     },
     photos,
-    missingThumbs: missingRow?.n ?? 0,
-    untaggedCount: untaggedRow?.n ?? 0,
+    missingThumbs,
+    untaggedCount,
     nextCursor: hasMore && page.length ? encodeCursor(page[page.length - 1].sort_at,
                                                        page[page.length - 1].id) : null,
     urlExpiresIn: PHOTO_URL_TTL,
@@ -1426,11 +1444,12 @@ async function onThisDay(request, env) {
       LIMIT 60`
   ).bind(todayMd, ...params).all();
 
-  const photos = [];
-  for (const r of results) {
+  // 行级签名并行
+  const mediaList = await Promise.all(results.map((r) => presignMedia(env, r)));
+  const photos = results.map((r, idx) => {
     let tags = [];
     try { tags = r.tags ? JSON.parse(r.tags) : []; } catch { tags = []; }
-    photos.push({
+    return {
       id: r.id,
       albumId: r.album_id,
       albumName: r.album_name,
@@ -1449,12 +1468,11 @@ async function onThisDay(request, env) {
       isThumb: !!r.thumb_key,
       thumbHash: r.thumb_hash ?? null,
       exif: parseJson(r.exif),
-      ...(await presignMedia(env, r)),
-    });
-  }
+      ...mediaList[idx],
+    };
+  });
   return json({ ok: true, photos, todayMmDd: new Date().toISOString().slice(5, 10) });
 }
-
 // ---------- 地图视图：返回所有带 GPS 坐标的照片 ----------
 async function geoPhotos(request, env) {
   const reqUrl = new URL(request.url);
@@ -1483,21 +1501,20 @@ async function geoPhotos(request, env) {
       LIMIT 2000`
   ).bind(...params).all();
 
-  const photos = [];
-  for (const r of results) {
-    photos.push({
-      id: r.id,
-      albumId: r.album_id,
-      albumName: r.album_name,
-      filename: r.filename,
-      contentType: r.content_type,
-      kind: r.kind ?? 'image',
-      takenAt: r.taken_at,
-      lat: r.gps_lat,
-      lng: r.gps_lng,
-      ...(await presignMedia(env, r)),
-    });
-  }
+  // 行级签名并行
+  const mediaList = await Promise.all(results.map((r) => presignMedia(env, r)));
+  const photos = results.map((r, idx) => ({
+    id: r.id,
+    albumId: r.album_id,
+    albumName: r.album_name,
+    filename: r.filename,
+    contentType: r.content_type,
+    kind: r.kind ?? 'image',
+    takenAt: r.taken_at,
+    lat: r.gps_lat,
+    lng: r.gps_lng,
+    ...mediaList[idx],
+  }));
   return json({ ok: true, photos });
 }
 
@@ -1529,30 +1546,60 @@ async function findDuplicates(request, env) {
   const find = (x) => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
   const union = (x, y) => { const rx = find(x), ry = find(y); if (rx !== ry) parent[rx] = ry; };
 
+  // LSH 分桶：64-bit dHash（16 hex 字符）拆 8 段 × 8-bit，仅共享任一段的对才计算完整距离。
+  // 距离 ≤7 的对漏检率 <1%（需 8 个段全部含差异位才会漏），随机无关对进入候选 ~1/32，
+  // 全量比较从 O(n²) 降到 ~O(n²/64)，避免大库撞 Worker CPU 限额
+  const BANDS = 8;
+  const buckets = Array.from({ length: BANDS }, () => new Map());
   for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      if (hammingHex(results[i].phash, results[j].phash) < 8) {
-        union(i, j);
+    const h = results[i].phash;
+    for (let b = 0; b < BANDS; b++) {
+      const key = h.slice(b * 2, b * 2 + 2);
+      const arr = buckets[b].get(key);
+      if (arr) arr.push(i); else buckets[b].set(key, [i]);
+    }
+  }
+  const seen = new Set();
+  for (const bucketMap of buckets) {
+    for (const arr of bucketMap.values()) {
+      for (let x = 0; x < arr.length; x++) {
+        for (let y = x + 1; y < arr.length; y++) {
+          const i = arr[x], j = arr[y];
+          const pairKey = i * n + j;
+          if (seen.has(pairKey)) continue;
+          seen.add(pairKey);
+          if (hammingHex(results[i].phash, results[j].phash) < 8) union(i, j);
+        }
       }
     }
   }
 
-  const groupMap = new Map();
+  // 分组结构先行（纯 CPU），命中组的成员签名批量并行
+  const groupIdx = new Map(); // root -> [行号]
   for (let i = 0; i < n; i++) {
     const root = find(i);
-    if (!groupMap.has(root)) groupMap.set(root, []);
-    const r = results[i];
-    groupMap.get(root).push({
-      id: r.id,
-      filename: r.filename,
-      albumId: r.album_id,
-      albumName: r.album_name,
-      createdAt: r.created_at,
-      ...(await presignMedia(env, r)),
-    });
+    if (!groupIdx.has(root)) groupIdx.set(root, []);
+    groupIdx.get(root).push(i);
   }
+  const usedRows = [...groupIdx.values()]
+    .filter((rows) => rows.length >= 2).flat();
+  const mediaMap = new Map(
+    await Promise.all(usedRows.map(async (i) => [i, await presignMedia(env, results[i])]))
+  );
 
-  const groups = [...groupMap.values()].filter((g) => g.length >= 2);
+  const groups = [...groupIdx.values()]
+    .filter((rows) => rows.length >= 2)
+    .map((rows) => rows.map((i) => {
+      const r = results[i];
+      return {
+        id: r.id,
+        filename: r.filename,
+        albumId: r.album_id,
+        albumName: r.album_name,
+        createdAt: r.created_at,
+        ...mediaMap.get(i),
+      };
+    }));
   return json({ ok: true, groups });
 }
 
@@ -1677,19 +1724,26 @@ async function semanticSearch(request, env) {
       WHERE p.status = 'ready' AND p.embedding IS NOT NULL AND p.emb_model = ? ${scope.where}`
   ).bind(EMBED_VERSION, ...scope.params).all();
 
+  // 查询向量预归一化 + Float32Array：qn/sqrt 只算一次（原先每行重复计算，白耗 CPU）
+  const qv = Float32Array.from(queryVec);
+  const dim = qv.length;
+  let qn = 0;
+  for (let i = 0; i < dim; i++) qn += qv[i] * qv[i];
+  const qNorm = Math.sqrt(qn);
+
   const scored = [];
   for (const r of results) {
     let vec;
     try { vec = JSON.parse(r.embedding); } catch { continue; }
-    if (!Array.isArray(vec) || vec.length !== queryVec.length) continue;
+    if (!Array.isArray(vec) || vec.length !== dim) continue;
     // 余弦相似度
-    let dot = 0, qn = 0, vn = 0;
-    for (let i = 0; i < queryVec.length; i++) {
-      dot += queryVec[i] * vec[i];
-      qn += queryVec[i] * queryVec[i];
-      vn += vec[i] * vec[i];
+    let dot = 0, vn = 0;
+    for (let i = 0; i < dim; i++) {
+      const v = vec[i];
+      dot += qv[i] * v;
+      vn += v * v;
     }
-    const sim = qn > 0 && vn > 0 ? dot / (Math.sqrt(qn) * Math.sqrt(vn)) : 0;
+    const sim = qNorm > 0 && vn > 0 ? dot / (qNorm * Math.sqrt(vn)) : 0;
     if (sim > SEMANTIC_THRESHOLD) { // bge-m3 实测校准的阈值
       scored.push({
         id: r.id,
@@ -1701,12 +1755,18 @@ async function semanticSearch(request, env) {
         takenAt: r.taken_at,
         score: sim,
         thumbHash: r.thumb_hash ?? null,
-        ...(await presignMedia(env, r)),
+        _row: r, // 签名推迟到 top-K 裁剪后，避免对落选行白白签名
       });
     }
   }
   scored.sort((a, b) => b.score - a.score);
-  return json({ ok: true, photos: scored.slice(0, 50) });
+  const top = scored.slice(0, 50);
+  const mediaList = await Promise.all(top.map((s) => presignMedia(env, s._row)));
+  const photos = top.map((s, i) => {
+    const { _row, ...rest } = s;
+    return { ...rest, ...mediaList[i] };
+  });
+  return json({ ok: true, photos });
 }
 
 // ---------- 服务端搜索 / 标签云 ----------
@@ -1854,8 +1914,7 @@ async function searchPhotos(request, env, auth) {
 
   const hasMore = results.length > limit;
   const page = hasMore ? results.slice(0, limit) : results;
-  const photos = [];
-  for (const r of page) photos.push(await photoOut(env, r));
+  const photos = await Promise.all(page.map((r) => photoOut(env, r)));
 
   return json({
     ok: true,
@@ -1920,25 +1979,15 @@ async function listTagGroups(request, env, auth) {
   await ensureTagEmbTable(env);
   const clusters = await buildTagGroups(env, results);
 
+  // 组内照片数：直接对组内标签计数求和（零额外查询）。
+  // 近似依据：AI 打标提示词禁止同图出现互为近义的标签，同簇标签共存于同一照片的概率极低，
+  // 求和与 COUNT(DISTINCT photo) 几乎一致（仅手工打了近义标签时会轻微高估，展示场景可接受）。
   const nOf = new Map(results.map((r) => [r.tag, r.n]));
   const groups = [];
   for (const c of clusters) {
     const members = [...c.members].sort((a, b) => (nOf.get(b) ?? 0) - (nOf.get(a) ?? 0));
-    // 组内照片数按照片去重精确统计（同张照片可能带组内多个同义词）
-    const inClause = c.members.map(() => '?').join(',');
-    const gConds = [`p.status = 'ready'`, `pt.tag IN (${inClause})`];
-    const gParams = [...c.members];
-    if (scope.where) gConds.push(scope.where.replace(/^AND /, ''));
-    gParams.push(...scope.params);
-    if (scope.singlePhotoId) { gConds.push('p.id = ?'); gParams.push(scope.singlePhotoId); }
-    const { results: cnt } = await env.DB.prepare(
-      `SELECT COUNT(DISTINCT p.id) AS n
-         FROM photo p
-         JOIN photo_tag pt ON pt.photo_id = p.id
-         JOIN album a ON a.id = p.album_id
-        WHERE ${gConds.join(' AND ')}`
-    ).bind(...gParams).all();
-    groups.push({ rep: members[0], n: cnt[0]?.n ?? 0, tags: members });
+    const n = members.reduce((sum, t) => sum + (nOf.get(t) ?? 0), 0);
+    groups.push({ rep: members[0], n, tags: members });
   }
 
   groups.sort((a, b) => b.n - a.n || a.rep.localeCompare(b.rep, 'zh'));
@@ -2065,23 +2114,32 @@ async function smartEvents(request, env) {
     }
   }
 
-  const events = [];
+  const eventsRaw = [];
   for (const c of clusters) {
     if (c.count < 2) continue; // 单张不构成事件
     const cover = c.last; // 最近一张作封面
     const coverKey = cover.thumb_key ?? cover.thumb_avif_key ?? cover.object_key;
-    events.push({
+    eventsRaw.push({
       key: String(c.start),
       start: new Date(c.start).toISOString(),
       end: new Date(c.end).toISOString(),
       count: c.count,
       centerLat: c.locCount >= 2 ? c.sumLat / c.locCount : null,
       centerLng: c.locCount >= 2 ? c.sumLng / c.locCount : null,
-      thumbUrl: coverKey ? await presignR2(env, 'GET', coverKey, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
-      thumbAvifUrl: cover.thumb_avif_key
-        ? await presignR2(env, 'GET', cover.thumb_avif_key, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
+      coverKey,
+      coverAvifKey: cover.thumb_avif_key ?? null,
     });
   }
+  // 封面签名并行
+  const signed = await Promise.all(eventsRaw.map((e) => Promise.all([
+    e.coverKey ? presignR2(env, 'GET', e.coverKey, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
+    e.coverAvifKey ? presignR2(env, 'GET', e.coverAvifKey, PHOTO_URL_TTL, { cacheControl: THUMB_CACHE }) : null,
+  ])));
+  const events = eventsRaw.map((e, i) => ({
+    key: e.key, start: e.start, end: e.end, count: e.count,
+    centerLat: e.centerLat, centerLng: e.centerLng,
+    thumbUrl: signed[i][0], thumbAvifUrl: signed[i][1],
+  }));
   return json({ ok: true, events });
 }
 
@@ -2117,11 +2175,9 @@ async function smartPhotos(request, env) {
       LIMIT 300`
   ).bind(...params).all();
 
-  const photos = [];
-  for (const r of results) photos.push(await photoOut(env, r));
+  const photos = await Promise.all(results.map((r) => photoOut(env, r)));
   return json({ ok: true, photos });
 }
-
 async function route(request, env, ctx) {
   const missing = requireEnv(env);
   if (missing.length) return fail('服务未配置完成，缺少: ' + missing.join(', '), 503);

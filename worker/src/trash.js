@@ -210,6 +210,15 @@ export async function runScheduledCleanup(env) {
     summary.orphans = orphans.length;
   }
 
+  // 补齐缺失的 taken_md（历史回填已从冷启动迁移移至此处兜底；
+  // 命中 taken_md 索引，无缺失行时近乎零成本）
+  try {
+    await env.DB.prepare(
+      `UPDATE photo SET taken_md = substr(COALESCE(taken_at, created_at), 6, 5)
+        WHERE taken_md IS NULL AND COALESCE(taken_at, created_at) IS NOT NULL`
+    ).run();
+  } catch { /* 非致命 */ }
+
   // 失败计数表清理（30 天未更新）
   // 过期 30 天的登录失败记录
   await env.DB.prepare(
