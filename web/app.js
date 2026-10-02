@@ -2843,13 +2843,13 @@ async function renderOnThisDay() {
   }
 }
 
-// 动态加载 hls.js（仅播放 .m3u8 时按需加载）
+// 动态加载 hls.js（仅播放 .m3u8 时按需加载；自托管 vendor/hls，不请求第三方 CDN）
 let _hlsPromise = null;
 function loadHlsJs() {
   if (_hlsPromise) return _hlsPromise.then((Hls) => new Hls());
   _hlsPromise = new Promise((resolve, reject) => {
     const s = document.createElement('script');
-    s.src = 'https://unpkg.com/hls.js@1.5.13/dist/hls.min.js';
+    s.src = 'vendor/hls/hls.min.js';
     s.onload = () => (window.Hls ? resolve(window.Hls) : reject(new Error('hls.js 加载失败')));
     s.onerror = reject;
     document.head.appendChild(s);
@@ -2951,10 +2951,10 @@ function loadLeaflet() {
   _mapLoaded = new Promise((resolve, reject) => {
     const css = document.createElement('link');
     css.rel = 'stylesheet';
-    css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+    css.href = 'vendor/leaflet/dist/leaflet.css';
     document.head.appendChild(css);
     const js = document.createElement('script');
-    js.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+    js.src = 'vendor/leaflet/dist/leaflet.js';
     js.onload = () => resolve();
     js.onerror = reject;
     document.head.appendChild(js);
