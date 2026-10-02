@@ -20,6 +20,8 @@ import { verifyTurnstile } from './turnstile.js';
 import { createUsageMeter, flushUsage } from './usage-meter.js';
 import { costGuardDaily, r2UploadGuard, imagesUsedThisMonth, R2_FREE_BYTES,
          IMAGES_MONTHLY_CAP, IMAGES_MONTHLY_FREE } from './cost-guard.js';
+import { json, fail } from './util.js';
+import { bumpAlbumVersion, getAlbumVersion } from './album-version.js';
 
 // ---------- 常量 ----------
 
@@ -96,17 +98,6 @@ function withCors(resp, request) {
     resp.headers.set('Access-Control-Max-Age', '86400');
   }
   return resp;
-}
-
-function json(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', ...headers },
-  });
-}
-
-function fail(error, status = 400) {
-  return json({ ok: false, error }, status);
 }
 
 function delay(ms) {
@@ -441,23 +432,7 @@ async function runSchemaMigration(env) {
   ).run();
 }
 
-// 递增相册版本号（照片增删改、封面变更等都调用）
-async function bumpAlbumVersion(env, albumId) {
-  try {
-    await env.DB.prepare(
-      `INSERT INTO album_version(album_id, v) VALUES(?, 1)
-       ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
-    ).bind(albumId).run();
-  } catch { /* 版本递增失败不影响主流程 */ }
-}
-
-// 获取相册版本号
-async function getAlbumVersion(env, albumId) {
-  const row = await env.DB.prepare(
-    'SELECT v FROM album_version WHERE album_id = ?'
-  ).bind(albumId).first();
-  return row?.v ?? 0;
-}
+// 获取相册版本号：见 album-version.js（与 bump 同源）
 
 // ---------- 鉴权 ----------
 

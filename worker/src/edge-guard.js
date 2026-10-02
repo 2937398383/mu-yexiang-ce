@@ -76,7 +76,10 @@ export async function edgeGuard(request, env) {
 
   const url = new URL(request.url);
   const ua = request.headers.get('User-Agent') || '';
-  if (SCAN_PATH_RE.test(url.pathname) || BAD_UA_RE.test(ua) || !ua.trim()) {
+  // OG/分享元信息路径允许空 UA：Pages Function 的服务端子请求默认不带 UA
+  // （/s/:id 落地页靠这两个接口渲染分享卡片），其余路径空 UA 一律拦截
+  const isMetaPath = url.pathname.startsWith('/api/og/') || url.pathname.startsWith('/api/share/');
+  if (SCAN_PATH_RE.test(url.pathname) || BAD_UA_RE.test(ua) || (!ua.trim() && !isMetaPath)) {
     return new Response(JSON.stringify({ ok: false, error: '请求已被拦截' }), {
       status: 403,
       headers: { 'Content-Type': 'application/json; charset=utf-8' },

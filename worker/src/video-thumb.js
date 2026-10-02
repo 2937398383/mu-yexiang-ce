@@ -3,6 +3,8 @@
 // 官方限制：输入 <100MB、时长 <10 分钟、官方仅保证 H.264 MP4；其他格式 best-effort
 // 全部调用均为 best-effort：失败仅记日志，不影响原视频与主流程
 
+import { bumpAlbumVersion } from './album-version.js';
+
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
 const FRAME_TIME = '1s'; // 取 1 秒处，避免片头黑屏
 
@@ -56,13 +58,8 @@ export async function ensureVideoProxy(env, photo) {
     await env.DB.prepare('UPDATE photo SET proxy_key = ? WHERE id = ?')
       .bind(proxyKey, photo.id).run();
     // 代理生成 → 相册列表 ETag 失效
-    try {
       const aid = (await env.DB.prepare('SELECT album_id FROM photo WHERE id = ?').bind(photo.id).first())?.album_id;
-      if (aid) await env.DB.prepare(
-        `INSERT INTO album_version(album_id, v) VALUES(?, 1)
-         ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
-      ).bind(aid).run();
-    } catch { /* ignore */ }
+      if (aid) await bumpAlbumVersion(env, aid);
     return { ok: true };
   } catch (e) {
     console.log('ensureVideoProxy failed:', photo.id, e?.message ?? String(e));
@@ -100,13 +97,8 @@ export async function ensureVideoPoster(env, photo) {
         'UPDATE photo SET thumb_key = ?, large_key = ? WHERE id = ?'
       ).bind(smallKey, largeKey, photo.id).run();
       // 封面帧生成 → 相册列表 ETag 失效
-      try {
         const aid = (await env.DB.prepare('SELECT album_id FROM photo WHERE id = ?').bind(photo.id).first())?.album_id;
-        if (aid) await env.DB.prepare(
-          `INSERT INTO album_version(album_id, v) VALUES(?, 1)
-           ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
-        ).bind(aid).run();
-      } catch { /* ignore */ }
+        if (aid) await bumpAlbumVersion(env, aid);
     } catch (e) {
       await env.DB.prepare(
         'UPDATE photo SET thumb_key = ? WHERE id = ?'

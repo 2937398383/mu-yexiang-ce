@@ -6,6 +6,7 @@
 // Workers AI 免费额度 10000 neurons/天（UTC 0 点重置），与账户其他 AI 调用共享
 import { getAuth } from './auth.js';
 import { consumeWindowQuota, refundWindowQuota } from './quota.js';
+import { fail, todayUTC, dataUriToBytes } from './util.js';
 
 const MODELS = {
   fast: '@cf/black-forest-labs/flux-2-klein-4b',
@@ -188,17 +189,6 @@ async function ensureQuotaTable(env) {
   tableEnsured = true;
 }
 
-function jsonFail(error, status = 400) {
-  return new Response(JSON.stringify({ ok: false, error }), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
-}
-
-function todayUTC() {
-  return new Date().toISOString().slice(0, 10);
-}
-
 // 原子消费（quota.js）：检查与自增单语句完成，并发下不超限
 async function checkAndConsumeQuota(env, ip, tier) {
   const limit = DAILY_LIMIT[tier];
@@ -216,14 +206,6 @@ function refundQuota(env, ip, tier) {
     table: 'style_quota',
     keys: [['ip', ip], ['day', todayUTC()], ['tier', tier]],
   });
-}
-
-function dataUriToBytes(dataUri) {
-  const b64 = dataUri.slice(dataUri.indexOf(',') + 1);
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
 }
 
 // 根据魔数判断图片格式，返回正确的 MIME
@@ -291,28 +273,28 @@ export async function handleStyleTransfer(request, env) {
   try {
     body = await request.json();
   } catch {
-    return jsonFail('请求体不是合法 JSON');
+    return fail('请求体不是合法 JSON');
   }
 
   const style = STYLES[body.style] ? body.style : null;
   const tier = MODELS[body.tier] ? body.tier : null;
-  if (!style) return jsonFail('未知的风格类型');
-  if (!tier) return jsonFail('未知的生成档位');
+  if (!style) return fail('未知的风格类型');
+  if (!tier) return fail('未知的生成档位');
   const fix = body.fix && STYLES[style].fixes[body.fix] ? body.fix : null;
 
   const image = body.image;
   if (typeof image !== 'string' || !/^data:image\/(png|jpe?g|webp|bmp);base64,/.test(image)) {
-    return jsonFail('缺少 image 参数（需为 base64 data URI 图片）');
+    return fail('缺少 image 参数（需为 base64 data URI 图片）');
   }
   if (image.length > MAX_DATAURI_LEN) {
-    return jsonFail('参考图过大，请压缩到 512px 以内再试', 413);
+    return fail('参考图过大，请压缩到 512px 以内再试', 413);
   }
 
   const width = Number(body.width);
   const height = Number(body.height);
   if (!Number.isFinite(width) || !Number.isFinite(height) ||
       width < 256 || width > 1536 || height < 256 || height > 1536) {
-    return jsonFail('输出尺寸不合法（需在 256~1536 之间）');
+    return fail('输出尺寸不合法（需在 256~1536 之间）');
   }
 
   let seed = null;
@@ -327,7 +309,7 @@ export async function handleStyleTransfer(request, env) {
     quota = await checkAndConsumeQuota(env, ip, tier);
     if (!quota.allowed) {
       const label = tier === 'hd' ? '高质量' : '快速';
-      return jsonFail(`今日${label}档额度已用完（每天 ${DAILY_LIMIT[tier]} 张，UTC 0 点重置），明天再来或换另一档`, 429);
+      return fail(`今日${label}档额度已用完（每天 ${DAILY_LIMIT[tier]} 张，UTC 0 点重置），明天再来或换另一档`, 429);
     }
   }
 
@@ -362,6 +344,6 @@ export async function handleStyleTransfer(request, env) {
     });
   } catch (e) {
     if (quota) await refundQuota(env, ip, tier);
-    return jsonFail(e?.message ?? '风格化失败', e?.status ?? 502);
+    return fail(e?.message ?? '风格化失败', e?.status ?? 502);
   }
 }

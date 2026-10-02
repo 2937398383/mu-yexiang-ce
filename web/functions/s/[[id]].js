@@ -21,11 +21,7 @@ function escHtml(s) {
 async function fetchShareMeta(id) {
   try {
     const resp = await fetch(`${API_ORIGIN}/api/share/${encodeURIComponent(id)}`, {
-      // 必须带 UA：Worker edgeGuard 会拦截空 UA 的请求（Worker 子请求默认不带）
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'MuyeAlbum-PagesFunction/1.0 (+https://album-web.pages.dev)',
-      },
+      headers: { Accept: 'application/json' },
       cf: { cacheTtl: 0 },
     });
     const data = await resp.json();

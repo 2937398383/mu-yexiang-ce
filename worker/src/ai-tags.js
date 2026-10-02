@@ -2,6 +2,8 @@
 // 额度：全站每日 200 张（免费层 10000 neurons/天，单张实测约 5~20 neurons，留足余量）
 // 2026-09-27：LLaVA 1.5 7B → Llama 3.2 11B Vision；结构化 JSON 输出 + 同义词归一/包含去重
 import { consumeWindowQuota } from './quota.js';
+import { bumpAlbumVersion } from './album-version.js';
+import { todayUTC } from './util.js';
 
 const MODEL = '@cf/meta/llama-3.2-11b-vision-instruct';
 // bge-m3：多语言（含中文）文本向量，1024 维；2026-09 实测中文家庭相册查询 7/7 命中，
@@ -68,10 +70,6 @@ const SYNONYM_MAP = (() => {
 const ONE_CHAR_ALLOW = new Set(
   ['狗', '猫', '车', '海', '山', '雪', '花', '树', '天', '云', '雨', '夜', '灯', '船', '桥', '湖']
 );
-
-function todayUTC() {
-  return new Date().toISOString().slice(0, 10);
-}
 
 // 额度预检 + 消费（原子：quota.js 单语句完成检查与自增，并发下不超每日全站限额）
 async function consumeQuota(env) {
@@ -325,13 +323,8 @@ export async function tagPhoto(env, photo) {
         }
       } catch { /* photo_tag 维护失败不影响打标 */ }
       // 标签变更 → 相册列表 ETag 失效
-      try {
         const aid = (await env.DB.prepare('SELECT album_id FROM photo WHERE id = ?').bind(photo.id).first())?.album_id;
-        if (aid) await env.DB.prepare(
-          `INSERT INTO album_version(album_id, v) VALUES(?, 1)
-           ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
-        ).bind(aid).run();
-      } catch { /* ignore */ }
+        if (aid) await bumpAlbumVersion(env, aid);
       return { tags, desc, attempts: attempt };
     }
     lastReason = 'fewer-than-min-tags';

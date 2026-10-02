@@ -1,5 +1,6 @@
 // 回收站：软删除后的查看/还原/彻底删除/清空，以及 scheduled 定时清理
 import { presignR2 } from './presign.js';
+import { bumpAlbumVersion } from './album-version.js';
 
 const TRASH_URL_TTL = 900;
 const EMPTY_BATCH = 100;       // 清空回收站单轮张数
@@ -116,13 +117,7 @@ export async function restorePhoto(env, photoId, targetAlbumId) {
   await env.DB.prepare(
     "UPDATE photo SET status = 'ready', trashed_at = NULL, album_id = ? WHERE id = ?"
   ).bind(target, photoId).run();
-  // 递增相册版本号（列表 ETag 失效）
-  try {
-    await env.DB.prepare(
-      `INSERT INTO album_version(album_id, v) VALUES(?, 1)
-       ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
-    ).bind(target).run();
-  } catch { /* ignore */ }
+  await bumpAlbumVersion(env, target);
   return { ok: true, albumId: target };
 }
 

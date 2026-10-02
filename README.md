@@ -75,6 +75,8 @@ D1 置为 ready，异步 AI 打标
     │   ├── auth.js          # JWT / 密码哈希 / 常量时间比较
     │   ├── auth-guard.js    # 解锁态与失败锁定（原子计数）
     │   ├── quota.js         # 原子配额/计数工具（单语句「检查+自增」）
+    │   ├── util.js          # 公共工具（json/fail/UTC 窗口/data URI 解码）
+    │   ├── album-version.js # 相册版本号（列表 ETag 失效）
     │   ├── cost-guard.js    # 成本护栏（R2/Images 免费额度监控与熔断）
     │   ├── edge-guard.js    # 边缘防护（方法白名单/扫描拦截/内存+D1 分级限流）
     │   ├── share.js         # 分享链接（album/photo/collect）

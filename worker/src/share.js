@@ -6,6 +6,7 @@
 // token 为 HS256 JWT，最长 24 小时；可设访问密码（防链接外泄）
 import { signJwt, hashSharePassword, timingSafeEqualStr } from './auth.js';
 import { checkLock, recordFailure, clearFailures } from './auth-guard.js';
+import { json, fail } from './util.js';
 
 const SHARE_TOKEN_TTL = 24 * 3600; // 换取的访问 token 最长 24h
 const DAYS_WHITELIST = new Set([1, 7, 30]);
@@ -13,20 +14,6 @@ const KINDS = new Set(['album', 'photo', 'collect']);
 // 路径式链接：Pages Functions(/s/:id) 向社交软件爬虫输出 OG 卡片，真人浏览器跳回 #/share/:id
 const BASE_URL = 'https://album-web.pages.dev/s/';
 const COLLECT_HOUR_LIMIT = 50;
-
-function fail(error, status = 400, extra = {}) {
-  return new Response(JSON.stringify({ ok: false, error, ...extra }), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
-}
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
-}
 
 // 生成分享链接（管理员）
 export async function createShare(request, env) {

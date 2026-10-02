@@ -4,6 +4,7 @@
 // Free 计划每月 5000 unique transformations（每张照片 2 次）；input 上限 20MB。
 // 月度用量由 cost-guard 计量（app_meta），达到熔断线时返回 quotaExhausted。
 import { takeImagesQuota, refundImagesQuota } from './cost-guard.js';
+import { bumpAlbumVersion } from './album-version.js';
 
 const BATCH_SIZE = 5;
 const MAX_INPUT_BYTES = 20_000_000;
@@ -112,12 +113,7 @@ export async function runBackfillBatch(env, opts = {}) {
         'UPDATE photo SET thumb_key = ?, large_key = ? WHERE id = ?'
       ).bind(smallKey, largeKey, p.id).run();
       // 缩略图生成 → 相册列表 ETag 失效
-      try {
-        await env.DB.prepare(
-          `INSERT INTO album_version(album_id, v) VALUES(?, 1)
-           ON CONFLICT(album_id) DO UPDATE SET v = v + 1`
-        ).bind(p.album_id).run();
-      } catch { /* ignore */ }
+      await bumpAlbumVersion(env, p.album_id);
       processed++;
       doneIds.push(p.id);
     } catch {
