@@ -1,8 +1,9 @@
 # 部署：push main 时先跑测试，通过后部署 Worker 与 Pages
 # 首次使用前需在 GitHub 仓库 Settings → Secrets and variables → Actions 配置：
-#   CLOUDFLARE_API_TOKEN   — 权限：Workers Scripts:Edit + Pages:Edit + D1:Edit + R2 不需要（绑定性操作）
+#   CLOUDFLARE_API_TOKEN   — 权限：Workers Scripts:Edit + Pages:Edit + D1:Edit
 #   CLOUDFLARE_ACCOUNT_ID  — Cloudflare 账户 ID
-# 未配置 Secret 时本工作流自动跳过（不会红叉）。
+# 未配置 Secret 时部署步骤自动跳过（job 显示为绿色跳过，不会红叉）。
+# 注意：GitHub 不允许在 job 级 if 中引用 secrets 上下文，因此判断放在 step 级。
 name: Deploy
 
 on:
@@ -27,7 +28,6 @@ jobs:
 
   deploy-worker:
     needs: test
-    if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,9 +35,11 @@ jobs:
         with:
           node-version: 22
       - name: Install worker dependencies
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: worker
         run: npm ci
       - name: Deploy Worker
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: worker
         run: npx wrangler deploy
         env:
@@ -46,7 +48,6 @@ jobs:
 
   deploy-pages:
     needs: deploy-worker
-    if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,9 +55,11 @@ jobs:
         with:
           node-version: 22
       - name: Install worker dependencies
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: worker
         run: npm ci
       - name: Deploy Pages
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
         working-directory: worker
         run: npx wrangler pages deploy ../web --project-name album-web --commit-dirty=true
         env:
