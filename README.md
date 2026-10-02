@@ -1,5 +1,7 @@
 # 牧野云相册
 
+![CI](https://github.com/2937398383/mu-yexiang-ce/actions/workflows/ci.yml/badge.svg)
+
 基于 **Cloudflare 全家桶**（Workers + R2 + D1 + Pages + Workers AI）的零服务器成本自托管相册。无构建步骤，前端纯原生 HTML/CSS/JS，数据存储在你自己的 Cloudflare 账户中。
 
 ## 特性

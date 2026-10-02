@@ -1,0 +1,33 @@
+# CI：push / PR 时自动跑单元测试与语法检查
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install worker dependencies
+        working-directory: worker
+        run: npm ci
+
+      - name: Unit tests (node --test)
+        working-directory: worker
+        run: npm test
+
+      - name: Syntax check (worker ESM)
+        working-directory: worker
+        run: for f in src/*.js; do node --check "$f"; done
+
+      - name: Syntax check (web classic scripts)
+        working-directory: web
+        run: for f in *.js; do node --check "$f"; done
