@@ -12,7 +12,10 @@ const SHARE_TOKEN_TTL = 24 * 3600; // 换取的访问 token 最长 24h
 const DAYS_WHITELIST = new Set([1, 7, 30]);
 const KINDS = new Set(['album', 'photo', 'collect']);
 // 路径式链接：Pages Functions(/s/:id) 向社交软件爬虫输出 OG 卡片，真人浏览器跳回 #/share/:id
-const BASE_URL = 'https://album-web.pages.dev/s/';
+// 站点域名来自 wrangler.toml vars 的 SITE_URL（换域名只改配置），未配置时回退部署默认值
+function siteUrl(env) {
+  return (env.SITE_URL || 'https://album-web.pages.dev').replace(/\/+$/, '');
+}
 const COLLECT_HOUR_LIMIT = 50;
 
 // 生成分享链接（管理员）
@@ -60,7 +63,7 @@ export async function createShare(request, env) {
     kind,
     photoId,
     hasPassword: !!passwordHash,
-    url: BASE_URL + id,
+    url: siteUrl(env) + '/s/' + id,
     expiresAt: row.expires_at,
   }, 201);
 }
@@ -84,7 +87,7 @@ export async function listShares(request, env) {
       photoId: r.photo_id,
       photoFilename: r.photo_filename,
       hasPassword: !!r.password_hash,
-      url: BASE_URL + r.id,
+      url: siteUrl(env) + '/s/' + r.id,
       createdAt: r.created_at,
       expiresAt: r.expires_at,
     })),

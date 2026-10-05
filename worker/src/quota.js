@@ -21,7 +21,6 @@ export async function consumeWindowQuota(env, { table, keys, limit, touchUpdated
   const cols = keys.map(([c]) => c);
   const vals = keys.map(([, v]) => v);
   const placeholders = cols.map(() => '?').join(', ');
-  const conflictCols = cols.map((c) => `${table}.${c}`).join(', ');
   const setExtra = touchUpdatedAt ? ", updated_at = datetime('now')" : '';
   try {
     const row = await env.DB.prepare(
@@ -47,7 +46,6 @@ export async function consumeWindowQuota(env, { table, keys, limit, touchUpdated
 export async function refundWindowQuota(env, { table, keys }) {
   const cols = keys.map(([c]) => c);
   const vals = keys.map(([, v]) => v);
-  const conflictCols = cols.map((c) => `${table}.${c}`).join(', ');
   const setExtra = cols.some(([c]) => c === 'updated_at')
     ? ", updated_at = datetime('now')" : '';
   try {

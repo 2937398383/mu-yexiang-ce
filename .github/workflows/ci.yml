@@ -20,6 +20,11 @@ jobs:
         working-directory: worker
         run: npm ci
 
+      - name: Lint (ESLint)
+        run: |
+          npm ci
+          npm run lint
+
       - name: Unit tests (node --test)
         working-directory: worker
         run: npm test

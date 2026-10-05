@@ -128,6 +128,14 @@ npx wrangler d1 execute album-db --remote --file=./schema.sql
 创建 Pages 项目（如 `album-web`），上传目录指向 `web/`。
 编辑 `web/config.js` 中的 API 地址即可。
 
+## 换域名清单
+自托管换自己的域名时，共需改动以下几处（其余代码无需动）：
+1. `worker/wrangler.toml`：`routes` 的 API 域名 + `[vars]` 的 `SITE_URL`（分享链接/OG 图标由它拼接）
+2. `web/config.js`：`API_BASE` 指向新 Worker 域名
+3. `web/functions/s/[[id]].js`：`apiOrigin()`/`siteUrl()` 中的默认值（或在 Pages 环境变量配 `API_ORIGIN`/`SITE_URL` 覆盖）
+4. `web/index.html`：`preconnect` 的 R2 与 API 域名
+5. Cloudflare 侧：R2 CORS 白名单（`worker/r2-cors.json`）与 Worker CORS 白名单（`worker/src/index.js` 的 `ORIGIN_WHITELIST`）
+
 ## 安全说明
 - CORS 已收紧为域名白名单
 - 管理员登录、相册解锁、分享解锁均有按 IP 失败计数与临时锁定（原子计数，并发下不失效）

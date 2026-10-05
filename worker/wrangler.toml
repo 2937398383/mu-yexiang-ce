@@ -19,6 +19,9 @@ crons = ["17 16 * * *"]
 [vars]
 R2_ACCOUNT_ID = "65e1870ebd61513b5e09664b1673a5ed"
 R2_BUCKET = "album-photos"
+# 站点主域名（不带尾斜杠）：分享链接、OG 兜底图标等用它拼接；
+# 换域名时与 web/config.js 的 API_BASE、web/functions/s/[[id]].js 的默认值一起改（README 有清单）
+SITE_URL = "https://cdc2937398383qqcom.dpdns.org"
 
 # 以下 5 个是敏感信息，不用写在这里，部署时用 wrangler secret put 逐个设置：
 #   npx wrangler secret put ADMIN_PASSWORD      （管理员登录密码）

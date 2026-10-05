@@ -300,22 +300,35 @@ async function api(method, path, body, albumIdForUnlock) {
   else if (unlock) headers.Authorization = 'Bearer ' + unlock;
   if (body != null) headers['Content-Type'] = 'application/json';
 
+  // 普通请求 30s 超时（AbortController）：卡死的请求不再无限挂起；
+  // 照片直传 R2 走独立 fetch，不受此限制
+  const doFetch = (opts = {}) => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 30000);
+    return fetch(window.API_BASE + path, {
+      method, headers, signal: ctrl.signal,
+      body: body != null ? JSON.stringify(body) : undefined,
+      ...opts,
+    }).finally(() => clearTimeout(timer));
+  };
+
   let resp;
   try {
-    resp = await fetch(window.API_BASE + path, {
-      method, headers, body: body != null ? JSON.stringify(body) : undefined,
-      ...(method === 'GET' && Date.now() < apiDirtyUntil ? { cache: 'reload' } : {}),
-    });
-  } catch {
-    throw { status: 0, message: '网络错误：请检查 config.js 里的 Worker 地址' };
+    resp = await doFetch(method === 'GET' && Date.now() < apiDirtyUntil ? { cache: 'reload' } : {});
+  } catch (e) {
+    throw { status: 0, message: e?.name === 'AbortError'
+      ? '请求超时（30 秒），请检查网络后重试'
+      : '网络错误：请检查 config.js 里的 Worker 地址' };
   }
   let data = await resp.json().catch(() => ({}));
   // 服务冷启动迁移中的 503：等一小会儿自动重试一次（Worker 并发迁移失败会很快自愈）
   if (resp.status === 503 && data.retryable) {
     await new Promise((r) => setTimeout(r, 900));
-    resp = await fetch(window.API_BASE + path, {
-      method, headers, body: body != null ? JSON.stringify(body) : undefined,
-    });
+    try {
+      resp = await doFetch();
+    } catch (e) {
+      throw { status: 0, message: e?.name === 'AbortError' ? '请求超时（30 秒）' : '网络错误' };
+    }
     data = await resp.json().catch(() => ({}));
   }
   if (!resp.ok || data.ok === false) {
@@ -689,7 +702,6 @@ function showBatchPwModal() {
 
 let currentPhotos = [];
 let currentAlbumId = null;
-let currentCoverPhotoId = null;
 let shareMode = false; // 分享链接只读模式（隐藏管理/工具按钮）
 let collectMode = false; // 求照片页：访客可匿名上传，不展示任何照片
 let selectMode = false;  // 多选批量模式（管理员）

@@ -1,3 +1,4 @@
+/* eslint-disable no-misleading-character-class -- emoji/变体选择符清洗正则，字符类意图明确 */
 // AI 照片标签：Workers AI Llama 3.2 11B Vision 图生文，异步打标，失败不阻塞主流程
 // 额度：全站每日 200 张（免费层 10000 neurons/天，单张实测约 5~20 neurons，留足余量）
 // 2026-09-27：LLaVA 1.5 7B → Llama 3.2 11B Vision；结构化 JSON 输出 + 同义词归一/包含去重
@@ -135,11 +136,11 @@ function cleanTag(raw) {
   let t = String(raw ?? '')
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}]/gu, '')
     .trim()
-    .replace(/^\s*\d+\s*[.、:：)\-]?\s*/, '') // 序号前缀：1. / 2、 / 3)
-    .replace(/^["'“”‘’「」『』《》()（）\[\]【】\s]+|["'“”‘’「」『』《》()（）\[\]【】\s。.,，、;；:：!！?？]+$/g, '')
+    .replace(/^\s*\d+\s*[.、:：)-]?\s*/, '') // 序号前缀：1. / 2、 / 3)
+    .replace(/^["'“”‘’「」『』《》()（）[]【】\s]+|["'“”‘’「」『』《》()（）[]【】\s。.,，、;；:：!！?？]+$/g, '')
     .trim();
   // JSON 残片（如 {"tags":["女孩）直接丢弃
-  if (/[{}\[\]\\":]/.test(t)) return '';
+  if (/[{}[]\\":]/.test(t)) return '';
   t = SYNONYM_MAP.get(t) ?? t;
   return t;
 }
@@ -201,10 +202,10 @@ function extractDesc(text) {
 function cleanDesc(raw) {
   let d = String(raw ?? '')
     .replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}]/gu, '')
-    .replace(/^\s*\d+\s*[.、:：)\-]?\s*/, '')
-    .replace(/^["'“”‘’「」『』《》()（）\[\]【】\s]+|["'“”‘’「」『』《》()（）\[\]【】\s]+$/g, '')
+    .replace(/^\s*\d+\s*[.、:：)-]?\s*/, '')
+    .replace(/^["'“”‘’「」『』《》()（）[]【】\s]+|["'“”‘’「」『』《》()（）[]【】\s]+$/g, '')
     .trim();
-  if (/[{}\[\]\\"]/.test(d)) return null;
+  if (/[{}[]\\"]/.test(d)) return null;
   if (!/[\u4e00-\u9fa5]/.test(d)) return null;
   if (d.length < 8 || d.length > 60) return null;
   return d;

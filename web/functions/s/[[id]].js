@@ -3,10 +3,17 @@
 //       真人浏览器访问时跳转到前端 hash 路由 /#/share/:id（老链接 hash 直开不受影响）。
 // 部署：随 web 目录一起 wrangler pages deploy，无需额外配置。
 
-const API_ORIGIN = 'https://api.cdc2937398383qqcom.dpdns.org';
+// 域名优先读 Pages 环境变量（dashboard → Pages → Settings → Variables），
+// 未配置时回退部署默认值；换域名改动清单见 README「换域名清单」
+function apiOrigin(env) {
+  return (env && env.API_ORIGIN ? String(env.API_ORIGIN) : 'https://api.cdc2937398383qqcom.dpdns.org').replace(/\/+$/, '');
+}
+function siteUrl(env) {
+  return (env && env.SITE_URL ? String(env.SITE_URL) : 'https://album-web.pages.dev').replace(/\/+$/, '');
+}
 const SITE_NAME = '牧野云相册';
 const DEFAULT_DESC = '点击查看分享的相册照片';
-const DEFAULT_ICON = 'https://album-web.pages.dev/icons/icon-512.png';
+
 
 function escHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -18,9 +25,9 @@ function escHtml(s) {
 // 无密码 → 200 { album:{name,description}, kind }
 // 有密码 → 401 { needsPassword:true, kind }（不返回相册名，避免泄露）
 // 失效/异常 → null（兜底通用卡片）
-async function fetchShareMeta(id) {
+async function fetchShareMeta(env, id) {
   try {
-    const resp = await fetch(`${API_ORIGIN}/api/share/${encodeURIComponent(id)}`, {
+    const resp = await fetch(`${apiOrigin(env)}/api/share/${encodeURIComponent(id)}`, {
       headers: { Accept: 'application/json' },
       cf: { cacheTtl: 0 },
     });
@@ -37,9 +44,9 @@ async function fetchShareMeta(id) {
   }
 }
 
-function renderHtml(id, meta) {
+function renderHtml(env, id, meta) {
   const shareUrl = `https://album-web.pages.dev/s/${id}`;
-  const ogImage = `${API_ORIGIN}/api/og/${id}`;
+  const ogImage = `${apiOrigin(env)}/api/og/${id}`;
   const kind = meta?.kind;
   const title = meta?.name
     ? `${meta.name} - ${SITE_NAME}`
@@ -80,7 +87,7 @@ function renderHtml(id, meta) {
           border-radius: 20px; padding: 36px 28px; text-align: center; max-width: 360px;
           box-shadow: 0 12px 40px rgba(0,0,0,.25); }
   .logo { width: 72px; height: 72px; border-radius: 18px; margin: 0 auto 18px;
-          background: #fff url(${escHtml(DEFAULT_ICON)}) center/cover; }
+          background: #fff url(${escHtml(siteUrl(env) + '/icons/icon-512.png')}) center/cover; }
   h1 { font-size: 20px; margin-bottom: 10px; word-break: break-all; }
   p { font-size: 14px; opacity: .85; line-height: 1.6; margin-bottom: 24px;
        word-break: break-all; }
@@ -102,18 +109,18 @@ function renderHtml(id, meta) {
 </html>`;
 }
 
-export async function onRequestGet({ params }) {
+export async function onRequestGet({ params, env }) {
   const raw = params.id;
   const id = Array.isArray(raw) ? raw[0] : raw;
   // share id 固定 16 位 hex，非法直接兜底（同样跳前端由前端提示失效）
   if (!/^[0-9a-f]{16}$/i.test(String(id ?? ''))) {
-    return new Response(renderHtml(String(id ?? ''), null), {
+    return new Response(renderHtml(env, String(id ?? ''), null), {
       status: 404,
       headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
     });
   }
-  const meta = await fetchShareMeta(id);
-  return new Response(renderHtml(id, meta), {
+  const meta = await fetchShareMeta(env, id);
+  return new Response(renderHtml(env, id, meta), {
     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
   });
 }

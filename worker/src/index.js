@@ -14,7 +14,7 @@ import { createShare, listShares, revokeShare, redeemShare,
          collectHit, COLLECT_HOUR_LIMIT } from './share.js';
 import { tagPhotoOnUpload, backfillTags, EMBED_MODEL, EMBED_VERSION, SEMANTIC_THRESHOLD } from './ai-tags.js';
 import { buildTagGroups, ensureTagEmbTable } from './tag-groups.js';
-import { backfillVideoPosters, ensureVideoProxy } from './video-thumb.js';
+import { backfillVideoPosters, ensureVideoPoster, ensureVideoProxy } from './video-thumb.js';
 import { edgeGuard } from './edge-guard.js';
 import { verifyTurnstile } from './turnstile.js';
 import { createUsageMeter, flushUsage } from './usage-meter.js';
@@ -41,7 +41,6 @@ const IMG_EXT_WHITELIST = new Set([
 ]);
 // 视频有限支持：原样存储不转码；MEDIA 绑定官方仅保证 H.264 MP4
 const VIDEO_EXT_WHITELIST = new Set(['mp4', 'webm', 'mov', 'm4v']);
-const VIDEO_MAX_SIZE = 500 * 1024 * 1024; // 建议单个视频 ≤500MB
 // 扩展名 → 权威 MIME 映射（服务端按扩展名锁定 R2 对象 Content-Type，
 // 不信任客户端传入值，防止把 text/html 等存进 R2 形成存储型 XSS/钓鱼页）
 export const EXT_MIME = {
@@ -2011,7 +2010,10 @@ async function updatePhoto(request, env, photoId) {
 
 // ---------- 分享卡片封面（公开，供 OG 爬虫抓取） ----------
 
-const OG_DEFAULT_ICON = 'https://album-web.pages.dev/icons/icon-512.png';
+// OG 兜底图标：站点域名来自 wrangler.toml vars 的 SITE_URL（换域名只改配置）
+function ogDefaultIcon(env) {
+  return (env.SITE_URL || 'https://album-web.pages.dev').replace(/\/+$/, '') + '/icons/icon-512.png';
+}
 
 // GET /api/og/:shareId → 302 到封面签名图；无效链接或带访问密码的分享回退站点图标
 async function ogCover(request, env, shareId) {
@@ -2019,7 +2021,7 @@ async function ogCover(request, env, shareId) {
     `SELECT album_id, photo_id, password_hash FROM share_link
       WHERE id = ? AND revoked = 0 AND expires_at > datetime('now')`
   ).bind(shareId).first();
-  if (!share || share.password_hash) return Response.redirect(OG_DEFAULT_ICON, 302);
+  if (!share || share.password_hash) return Response.redirect(ogDefaultIcon(env), 302);
 
   const pickKey = async (photoId) => (await env.DB.prepare(
     `SELECT COALESCE(thumb_key, large_key, object_key) AS k FROM photo
@@ -2042,7 +2044,7 @@ async function ogCover(request, env, shareId) {
       key = r?.k ?? null;
     }
   }
-  if (!key) return Response.redirect(OG_DEFAULT_ICON, 302);
+  if (!key) return Response.redirect(ogDefaultIcon(env), 302);
   return Response.redirect(await presignR2(env, 'GET', key, PHOTO_URL_TTL), 302);
 }
 
