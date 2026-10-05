@@ -1,10 +1,7 @@
 // crypto-core.js 的 roundtrip 与防篡改测试（node --test）
-import { createRequire } from 'node:module';
 import { test, describe, before } from 'node:test';
 import assert from 'node:assert/strict';
-
-const require = createRequire(import.meta.url);
-const C = require('../../web/crypto-core.js');
+import * as C from '../../web/crypto-core.js';
 
 let salt, kek, albumKey, fkBytes, fileKey, nonceBase;
 

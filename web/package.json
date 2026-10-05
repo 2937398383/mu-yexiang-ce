@@ -1,0 +1,6 @@
+{
+  "name": "mu-ye-album-web",
+  "private": true,
+  "type": "module",
+  "description": "标记 web 目录为 ESM：crypto-core.js 等可被 Node 测试直接 import（浏览器端无影响）"
+}

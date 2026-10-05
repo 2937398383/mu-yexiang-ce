@@ -9,6 +9,11 @@ const browserGlobals = {
   fetch: 'readonly', AbortController: 'readonly', FormData: 'readonly', Blob: 'readonly',
   File: 'readonly', URL: 'readonly', URLSearchParams: 'readonly',
   createImageBitmap: 'readonly', requestIdleCallback: 'readonly',
+  setTimeout: 'readonly', clearTimeout: 'readonly', setInterval: 'readonly', clearInterval: 'readonly',
+  crypto: 'readonly', btoa: 'readonly', atob: 'readonly',
+  TextEncoder: 'readonly', TextDecoder: 'readonly',
+  Image: 'readonly', ImageData: 'readonly', Event: 'readonly', FileReader: 'readonly',
+  qrcode: 'readonly',
   IntersectionObserver: 'readonly', MutationObserver: 'readonly', ResizeObserver: 'readonly',
   CustomEvent: 'readonly', getComputedStyle: 'readonly', matchMedia: 'readonly',
   MediaSource: 'readonly', webkitAudioContext: 'readonly',
@@ -32,7 +37,7 @@ export default [
   {
     ignores: [
       'web/vendor/**', 'worker/scripts/**', 'worker/.wrangler/**', 'web/.wrangler/**',
-      'worker/.cf-home/**', 'worker/.tmp-ai-test/**', 'node_modules/**', '.trae/**', '.zcode/**',
+      'worker/.cf-home/**', 'worker/.tmp-ai-test/**', '.wrangler/**', 'node_modules/**', '.trae/**', '.zcode/**',
     ],
   },
   js.configs.recommended,
@@ -77,9 +82,27 @@ export default [
     },
   },
   {
-    // 前端：经典脚本（无构建，script 标签全局加载）
+    // 前端 ESM（S5 拆分：入口/基础层/工具模块随批次扩大）
+    files: ['web/app.js', 'web/crypto-core.js', 'web/upload-util.js', 'web/js/**/*.js'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      sourceType: 'module',
+      globals: {
+        ...browserGlobals,
+        // 过渡期（S5-Batch2 移除）：三个经典脚本工具页的渲染入口仍被 app.js 路由引用
+        renderIdPhoto: 'readonly', renderStyleTransfer: 'readonly', renderBgReplace: 'readonly',
+      },
+    },
+    rules: {
+      'no-console': 'off',
+      'no-empty': ['error', { allowEmptyCatch: true }],
+    },
+  },
+  {
+    // 前端：经典脚本（无构建，script 标签全局加载；S5 各批次逐步转入上方 ESM 组）
     files: ['web/**/*.js'],
-    ignores: ['web/vendor/**', 'web/functions/**'],
+    ignores: ['web/vendor/**', 'web/functions/**',
+      'web/app.js', 'web/crypto-core.js', 'web/upload-util.js', 'web/js/**'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'script',

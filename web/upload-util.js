@@ -5,13 +5,11 @@
  *    现代浏览器 createImageBitmap 自动按 EXIF 转正；大比例缩小分步减半保画质；
  *    Safari/iOS 无 WebP 编码器，自动回退 JPEG。
  */
-'use strict';
-
 // ---------- WebP 编码能力探测（页面生命周期缓存） ----------
 
 let webpSupportPromise = null;
 
-function supportsWebpEncoding() {
+export function supportsWebpEncoding() {
   if (!webpSupportPromise) {
     webpSupportPromise = new Promise((resolve) => {
       const c = document.createElement('canvas');
@@ -28,7 +26,7 @@ function supportsWebpEncoding() {
  * 从 File 提取 EXIF
  * @returns {Promise<{takenAt:?string, camera:?string, gpsLat:?number, gpsLng:?number, exif:?object}>}
  */
-async function extractExif(file) {
+export async function extractExif(file) {
   const out = { takenAt: null, camera: null, gpsLat: null, gpsLng: null, exif: null };
   if (!window.exifr) return out;
   let exif = null;
@@ -87,14 +85,14 @@ async function extractExif(file) {
 
 // ---------- 缩略图生成 ----------
 
-function fitLongEdge(w, h, edge) {
+export function fitLongEdge(w, h, edge) {
   if (Math.max(w, h) <= edge) return { w, h }; // 小图不放大
   const s = edge / Math.max(w, h);
   return { w: Math.round(w * s), h: Math.round(h * s) };
 }
 
 // 解码：显式要求按 EXIF 转正；旧浏览器（Safari15/iOS15）回退默认选项
-async function decodeBitmap(file) {
+export async function decodeBitmap(file) {
   try {
     return await createImageBitmap(file, { imageOrientation: 'from-image' });
   } catch {
@@ -107,7 +105,7 @@ async function decodeBitmap(file) {
 }
 
 // 等比缩放绘制；缩小倍数 >2 时分步减半，画质更好
-function drawScaled(source, sw, sh, dw, dh) {
+export function drawScaled(source, sw, sh, dw, dh) {
   let cv = document.createElement('canvas');
   cv.width = sw; cv.height = sh;
   let ctx = cv.getContext('2d');
@@ -138,7 +136,7 @@ function drawScaled(source, sw, sh, dw, dh) {
   return out;
 }
 
-async function encodeCanvas(canvas, webpQuality, jpegQuality) {
+export async function encodeCanvas(canvas, webpQuality, jpegQuality) {
   const toBlob = (type, q) => new Promise((r) => canvas.toBlob(r, type, q));
   if (await supportsWebpEncoding()) {
     const b = await toBlob('image/webp', webpQuality);
@@ -152,7 +150,7 @@ async function encodeCanvas(canvas, webpQuality, jpegQuality) {
 
 let avifSupportPromise = null;
 
-function supportsAvifEncoding() {
+export function supportsAvifEncoding() {
   if (!avifSupportPromise) {
     avifSupportPromise = new Promise((resolve) => {
       const c = document.createElement('canvas');
@@ -164,7 +162,7 @@ function supportsAvifEncoding() {
 }
 
 // 编码 AVIF；浏览器不支持或静默回退其他格式时返回 null（WebP/JPEG 兜底）
-async function encodeAvif(canvas, quality) {
+export async function encodeAvif(canvas, quality) {
   const toBlob = (q) => new Promise((r) => canvas.toBlob(r, 'image/avif', q));
   const b = await toBlob(quality);
   return (b && b.type === 'image/avif') ? b : null;
@@ -174,7 +172,7 @@ async function encodeAvif(canvas, quality) {
 
 // 从已有 canvas 缩到 ≤100px 后编码 thumbhash（零额外解码成本）
 // @returns {?string} base64 编码的 thumbhash（失败返回 null，不阻断上传）
-function computeThumbHash(canvas) {
+export function computeThumbHash(canvas) {
   try {
     if (!window.ThumbHash || !canvas || !canvas.width || !canvas.height) return null;
     const s = fitLongEdge(canvas.width, canvas.height, 100);
@@ -199,7 +197,7 @@ function computeThumbHash(canvas) {
  * @returns {Promise<{small:?Blob, large:?Blob, smallAvif:?Blob, thumbHash:?string}>}
  *   解码失败时 small/large 为 null，不阻断原图上传；AVIF 仅网格小图生成（省编码耗时），大图仍用 WebP/JPEG
  */
-async function makeThumbnails(file) {
+export async function makeThumbnails(file) {
   const bitmap = await decodeBitmap(file);
   if (!bitmap) return { small: null, large: null, smallAvif: null, thumbHash: null };
   try {
@@ -228,7 +226,7 @@ async function makeThumbnails(file) {
 // ---------- 视频抽帧 ----------
 
 // 等待事件（带超时）
-function waitEvent(el, eventName, timeout = 15000) {
+export function waitEvent(el, eventName, timeout = 15000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       cleanup();
@@ -244,7 +242,7 @@ function waitEvent(el, eventName, timeout = 15000) {
 }
 
 // 等下一帧真正可绘制（requestVideoFrameCallback 优先）；失败兜底超时
-function waitFrameReady(video) {
+export function waitFrameReady(video) {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, 3000);
     if (typeof video.requestVideoFrameCallback === 'function') {
@@ -260,7 +258,7 @@ function waitFrameReady(video) {
  * HEVC/浏览器无法解码时会抛错，由调用方按"无缩略图"处理
  * @returns {Promise<{small:?Blob, large:?Blob, duration:number, thumbHash:?string}>}
  */
-async function captureVideoFrame(file) {
+export async function captureVideoFrame(file) {
   const out = { small: null, large: null, duration: 0, thumbHash: null };
   const objectUrl = URL.createObjectURL(file);
   const video = document.createElement('video');
@@ -306,14 +304,14 @@ async function captureVideoFrame(file) {
 
 // ---------- HEIC / HEIF（iPhone 默认格式，多数浏览器无法原生解码） ----------
 
-function isHeicFile(file) {
+export function isHeicFile(file) {
   return /image\/hei(c|f)/i.test(file.type) || /\.(heic|heif)$/i.test(file.name || '');
 }
 
 let heicLoading = null;
 
 // 按需动态加载 heic2any（libheif WASM 内嵌，约 1.3MB，不拖慢首屏）
-function loadHeic2Any() {
+export function loadHeic2Any() {
   if (window.heic2any) return Promise.resolve();
   if (!heicLoading) {
     heicLoading = new Promise((resolve, reject) => {
@@ -332,7 +330,7 @@ function loadHeic2Any() {
  * 注意：必须在转换前提取 EXIF（转码后元数据可能丢失）；多页 HEIC 取第一页
  * @returns {Promise<File>}
  */
-async function ensureJpeg(file) {
+export async function ensureJpeg(file) {
   if (!isHeicFile(file)) return file;
   await loadHeic2Any();
   const blob = await window.heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 });
@@ -343,7 +341,7 @@ async function ensureJpeg(file) {
 
 // ---------- 感知哈希 dHash（9×8 灰度→相邻比较→64-bit hex） ----------
 // 用于重复照片检测：汉明距离 < 8 视为相似
-async function computeDHash(imageBlob) {
+export async function computeDHash(imageBlob) {
   try {
     const img = await createImageBitmap(imageBlob);
     const c = document.createElement('canvas');

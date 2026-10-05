@@ -3,55 +3,27 @@
  *   管理员 token → localStorage（关浏览器仍保留）
  *   相册解锁 token → sessionStorage（关标签页即失效，30 分钟后端也过期）
  */
-'use strict';
+import {
+  $view, $authArea, $modalRoot,
+  toast, esc, fmtSize, fmtDuration, renderAiProgress,
+  openModal, closeModal, confirmModal, promptModal, pwField,
+} from './js/ui.js';
+import {
+  api, saveToken, ADMIN_KEY, getUnlockToken, isAdmin,
+  renderTurnstileInto, turnstileToken,
+} from './js/api.js';
+import { promptAlbumPassword } from './js/auth.js';
+import { extractExif, makeThumbnails, captureVideoFrame, ensureJpeg, computeDHash } from './upload-util.js';
+import {
+  ENC_CHUNK, ENC_PBKDF2_ITERS,
+  enc_randomBytes, enc_b64url, enc_b64urlDecode, enc_importKey,
+  enc_deriveKEK, enc_generateAlbumKey, enc_wrapAlbumKey, enc_unwrapAlbumKey,
+  enc_generateFileKeyBytes, enc_encryptFileKey, enc_decryptFileKey,
+  enc_encryptMeta, enc_decryptMeta,
+  enc_encryptStream, enc_decryptStream, enc_encryptBlob, enc_decryptBlob,
+} from './crypto-core.js';
 
 // ==================== 基础工具 ====================
-
-const $view = document.getElementById('view');
-const $authArea = document.getElementById('auth-area');
-const $modalRoot = document.getElementById('modal-root');
-const $toastRoot = document.getElementById('toast-root');
-
-function toast(msg, isErr = false) {
-  const el = document.createElement('div');
-  el.className = 'toast' + (isErr ? ' err' : '');
-  el.textContent = msg;
-  $toastRoot.appendChild(el);
-  setTimeout(() => el.remove(), 2600);
-}
-
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
-
-function fmtSize(n) {
-  if (!n) return '';
-  if (n > 1 << 30) return (n / (1 << 30)).toFixed(1) + ' GB';
-  if (n > 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB';
-  return Math.max(1, Math.round(n / 1024)) + ' KB';
-}
-
-// AI 批量任务进度展示：文本 + 进度条
-function renderAiProgress(tipEl, { action, total, done, failed, remaining, quotaLeft, failReasons }) {
-  const processed = done + failed;
-  const pct = total ? Math.min(100, Math.round((processed / total) * 100)) : 0;
-  const text = `${action} ${done} 张${failed ? ` · ${failed} 张失败` : ''} · 剩余 ${remaining} 张 · 今日额度剩 ${quotaLeft}`;
-  const reasonsHtml = (failReasons?.length ? `<div class="ai-progress-reasons">失败原因：${esc(failReasons.join(' · '))}</div>` : '');
-  tipEl.innerHTML = `
-    <div class="ai-progress-text">${esc(text)}</div>
-    <div class="ai-progress-bar"><div class="ai-progress-fill" style="width:${pct}%"></div></div>
-    <div class="ai-progress-pct">${processed}/${total}（${pct}%）</div>
-    ${reasonsHtml}`;
-}
-
-// 视频时长：125 → "2:05"
-function fmtDuration(s) {
-  s = Math.max(0, Math.round(Number(s) || 0));
-  const m = Math.floor(s / 60), sec = s % 60;
-  return `${m}:${String(sec).padStart(2, '0')}`;
-}
 
 // ==================== 主题（白色 / 黑色） ====================
 
@@ -75,27 +47,6 @@ function initTheme() {
   });
 }
 
-// ==================== token 管理 ====================
-
-const ADMIN_KEY = 'album_admin_token';
-
-function saveToken(store, key, token, expiresIn) {
-  store.setItem(key, JSON.stringify({ token, exp: Date.now() + expiresIn * 1000 - 30000 }));
-}
-
-function getToken(store, key) {
-  try {
-    const o = JSON.parse(store.getItem(key));
-    if (o && o.token && o.exp > Date.now()) return o.token;
-    store.removeItem(key);
-  } catch { store.removeItem(key); }
-  return null;
-}
-
-const getAdminToken = () => getToken(localStorage, ADMIN_KEY);
-const getUnlockToken = (albumId) => getToken(sessionStorage, 'unlock_' + albumId);
-const isAdmin = () => !!getAdminToken();
-
 // 计算 Blob 的 SHA-256（64 位十六进制），用于同相册重复文件检测
 async function sha256Hex(blob) {
   const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
@@ -115,37 +66,6 @@ function renderAuthArea() {
     : `<button class="btn small" id="btn-login">管理员登录</button>`;
   document.getElementById('btn-login')?.addEventListener('click', showLoginModal);
   document.getElementById('btn-logout')?.addEventListener('click', logout);
-}
-
-// ==================== Turnstile（人机验证，防密码爆破） ====================
-
-// 是否启用人机验证：需站点密钥已配置且 SDK 已加载（未配置则整体降级，不影响登录/解锁）
-function turnstileEnabled() {
-  return !!(window.TURNSTILE_SITE_KEY && window.turnstile);
-}
-
-// 在弹窗打开后手动渲染 widget（render=explicit）
-function renderTurnstileInto(containerId) {
-  if (!turnstileEnabled()) return;
-  const el = document.getElementById(containerId);
-  if (el && !el.dataset.rendered) {
-    window.turnstile.render('#' + containerId, {
-      sitekey: window.TURNSTILE_SITE_KEY,
-      theme: 'auto',
-    });
-    el.dataset.rendered = '1';
-  }
-}
-
-// 提交时取 token；未启用验证码则返回 undefined（后端同样降级放行）
-function turnstileToken(containerId) {
-  if (!turnstileEnabled()) return undefined;
-  const el = document.getElementById(containerId);
-  if (el) {
-    const t = window.turnstile.getResponse(el);
-    if (t) return t;
-  }
-  throw { status: 400, message: '请先完成人机验证' };
 }
 
 // ==================== 加密相册（端到端，明文只在浏览器） ====================
@@ -288,132 +208,7 @@ function encBuildMeta(file, uploadBlob, exif, thumbs, isVideo, duration, chunks)
 
 // ==================== API 调用 ====================
 
-// P3：Worker 列表接口带 max-age=30 私有缓存。任何写操作成功后 35s 内的 GET 用
-// cache:'reload' 强制回源（新鲜结果会写回缓存），避免变更后短时间内看到旧列表
-let apiDirtyUntil = 0;
 
-async function api(method, path, body, albumIdForUnlock) {
-  const headers = {};
-  const admin = getAdminToken();
-  const unlock = albumIdForUnlock ? getUnlockToken(albumIdForUnlock) : null;
-  if (admin) headers.Authorization = 'Bearer ' + admin;
-  else if (unlock) headers.Authorization = 'Bearer ' + unlock;
-  if (body != null) headers['Content-Type'] = 'application/json';
-
-  // 普通请求 30s 超时（AbortController）：卡死的请求不再无限挂起；
-  // 照片直传 R2 走独立 fetch，不受此限制
-  const doFetch = (opts = {}) => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30000);
-    return fetch(window.API_BASE + path, {
-      method, headers, signal: ctrl.signal,
-      body: body != null ? JSON.stringify(body) : undefined,
-      ...opts,
-    }).finally(() => clearTimeout(timer));
-  };
-
-  let resp;
-  try {
-    resp = await doFetch(method === 'GET' && Date.now() < apiDirtyUntil ? { cache: 'reload' } : {});
-  } catch (e) {
-    throw { status: 0, message: e?.name === 'AbortError'
-      ? '请求超时（30 秒），请检查网络后重试'
-      : '网络错误：请检查 config.js 里的 Worker 地址' };
-  }
-  let data = await resp.json().catch(() => ({}));
-  // 服务冷启动迁移中的 503：等一小会儿自动重试一次（Worker 并发迁移失败会很快自愈）
-  if (resp.status === 503 && data.retryable) {
-    await new Promise((r) => setTimeout(r, 900));
-    try {
-      resp = await doFetch();
-    } catch (e) {
-      throw { status: 0, message: e?.name === 'AbortError' ? '请求超时（30 秒）' : '网络错误' };
-    }
-    data = await resp.json().catch(() => ({}));
-  }
-  if (!resp.ok || data.ok === false) {
-    // 错误对象附带完整响应体（如还原接口 409 时的可选相册列表）
-    throw { status: resp.status, message: data.error || '请求失败(' + resp.status + ')', data };
-  }
-  if (method !== 'GET') apiDirtyUntil = Date.now() + 35000;
-  return data;
-}
-
-// ==================== 模态框 ====================
-
-function closeModal() { $modalRoot.innerHTML = ''; }
-function openModal(html) {
-  $modalRoot.innerHTML = `<div class="modal-mask"><div class="modal">${html}</div></div>`;
-  $modalRoot.querySelector('.modal-mask').addEventListener('click', (e) => {
-    if (e.target === e.currentTarget) closeModal();
-  });
-  return $modalRoot.querySelector('.modal');
-}
-
-function confirmModal(title, text, okLabel = '确定', danger = false) {
-  return new Promise((resolve) => {
-    const m = openModal(`
-      <h2>${esc(title)}</h2>
-      ${text ? `<div class="warn">${esc(text)}</div>` : ''}
-      <div class="actions">
-        <button class="btn" data-r="0">取消</button>
-        <button class="btn ${danger ? 'danger' : 'primary'}" data-r="1">${esc(okLabel)}</button>
-      </div>`);
-    m.querySelectorAll('[data-r]').forEach((b) =>
-      b.addEventListener('click', () => { closeModal(); resolve(b.dataset.r === '1'); }));
-  });
-}
-
-function promptModal(title, fieldsHtml, onOk, okLabel = '确定') {
-  const m = openModal(`
-    <h2>${esc(title)}</h2>
-    ${fieldsHtml}
-    <div class="form-err" hidden></div>
-    <div class="actions">
-      <button class="btn" data-r="cancel">取消</button>
-      <button class="btn primary" data-r="ok">${esc(okLabel)}</button>
-    </div>`);
-  m.querySelector('[data-r="cancel"]').addEventListener('click', closeModal);
-  const okBtn = m.querySelector('[data-r="ok"]');
-  const errEl = m.querySelector('.form-err');
-  okBtn.addEventListener('click', async () => {
-    try {
-      errEl.hidden = true;
-      okBtn.disabled = true;
-      await onOk(m);
-      closeModal();
-    } catch (err) {
-      okBtn.disabled = false;
-      errEl.textContent = err.message || '操作失败';
-      errEl.hidden = false;
-      // 429 失败锁定：按钮倒计时禁用（弹框关闭后定时器自动清理）
-      if (err.status === 429 && err.data?.retryAfterMinutes) {
-        let left = Math.max(1, err.data.retryAfterMinutes) * 60;
-        okBtn.disabled = true;
-        const timer = setInterval(() => {
-          if (!okBtn.isConnected) { clearInterval(timer); return; }
-          left -= 1;
-          const mm = Math.floor(left / 60);
-          const ss = String(left % 60).padStart(2, '0');
-          okBtn.textContent = `已锁定 ${mm}:${ss}`;
-          if (left <= 0) {
-            clearInterval(timer);
-            okBtn.disabled = false;
-            okBtn.textContent = okLabel;
-          }
-        }, 1000);
-      }
-    }
-  });
-  return m;
-}
-
-const pwField = (id, label = '6位数字密码') => `
-  <div class="field">
-    <label>${label}</label>
-    <input class="pw" id="${id}" type="tel" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="off">
-    <div class="hint">留空表示不设密码（公开相册）</div>
-  </div>`;
 
 function showLoginModal() {
   const m = promptModal('管理员登录', `
@@ -460,32 +255,6 @@ function showUnlockModal(albumId, albumName, isEnc = false) {
   }, '解锁');
   m.querySelector('#f-pw').focus();
   renderTurnstileInto('turnstile-unlock');
-}
-
-// 工具页（证件照 / 换风格）使用的相册解锁：弹密码框，成功后只存 token 并 resolve(true)，不跳转；取消返回 false
-function promptAlbumPassword(albumId, albumName) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
-    const m = promptModal(`输入「${albumName}」的密码`, `
-      <div class="field">
-        <input class="pw" id="f-pw" type="tel" inputmode="numeric" maxlength="6" placeholder="••••••" autocomplete="off">
-      </div>
-      <div id="turnstile-unlock"></div>`, async (mm) => {
-      const pw = mm.querySelector('#f-pw').value;
-      if (!/^\d{6}$/.test(pw)) throw { message: '请输入6位数字密码' };
-      const ttoken = turnstileToken('turnstile-unlock');
-      const r = await api('POST', `/albums/${albumId}/unlock`, { password: pw, turnstileToken: ttoken });
-      saveToken(sessionStorage, 'unlock_' + albumId, r.token, r.expiresIn);
-      finish(true);
-    }, '解锁');
-    m.querySelector('[data-r="cancel"]').addEventListener('click', () => finish(false));
-    $modalRoot.querySelector('.modal-mask').addEventListener('click', (e) => {
-      if (e.target === e.currentTarget) finish(false);
-    });
-    m.querySelector('#f-pw').focus();
-    renderTurnstileInto('turnstile-unlock');
-  });
 }
 
 // ==================== 视图：相册列表 ====================
@@ -1227,7 +996,6 @@ async function renderAlbum(albumId) {
   }
   currentAlbumId = albumId;
   currentPhotos = [];
-  currentCoverPhotoId = data.album.coverPhotoId ?? null;
   searchState = { active: false, favoriteOnly: false, semantic: false };
   prefetchedPage = null;
   pageState = { cursor: data.nextCursor, loading: false, hasMore: !!data.nextCursor };
@@ -2230,7 +1998,6 @@ function openViewer(i) {
     try {
       btn.disabled = true;
       await api('PATCH', `/albums/${currentAlbumId}`, { coverPhotoId: q.id });
-      currentCoverPhotoId = q.id;
       toast('已设为相册封面');
     } catch (err) { toast(err.message, true); }
     btn.disabled = false;
@@ -2749,7 +2516,6 @@ async function bootShare(data) {
   saveToken(sessionStorage, 'unlock_' + data.album.id, data.token, data.expiresIn);
   currentAlbumId = data.album.id;
   currentPhotos = [];
-  currentCoverPhotoId = null;
 
   if (data.kind === 'collect') {
     renderCollectPage(data);
@@ -2836,7 +2602,6 @@ async function renderOnThisDay() {
   // 跨相册页：currentAlbumId 置空，照片带各自 albumId
   currentAlbumId = null;
   currentPhotos = data.photos;
-  currentCoverPhotoId = null;
   viewerCrossAlbum = true;
 
   $view.innerHTML = `
@@ -3439,6 +3204,13 @@ async function render() {
   if (m) await renderAlbum(m[1]);
   else await renderAlbums();
 }
+
+
+// ==================== 过渡兼容层（S5-Batch2 移除） ====================
+// 三个 AI 工具页尚未 ESM 化，仍以经典脚本运行，依赖这些全局函数；
+// Batch 2 工具页改 import 后此层整体删除
+// 工具页还依赖 $view（DOM 根引用；module 顶层 const 不再进入全局词法环境）
+Object.assign(window, { toast, esc, api, isAdmin, getUnlockToken, promptAlbumPassword, $view });
 
 window.addEventListener('hashchange', render);
 initTheme();
