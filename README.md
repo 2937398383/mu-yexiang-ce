@@ -58,16 +58,23 @@ D1 置为 ready，异步 AI 打标
 ## 目录结构
 
 ```
-├── web/                     # 前端静态站点（Pages 直接托管）
+├── web/                     # 前端静态站点（Pages 直接托管，ES modules 无构建）
 │   ├── index.html
-│   ├── app.js               # 主应用（路由/相册/查看器/分享/多选）
-│   ├── upload-util.js       # EXIF/缩略图/视频抽帧
-│   ├── idphoto.js           # 证件照工具
-│   ├── style-transfer.js    # 换风格页
-│   ├── bg-replace.js        # 换背景页
-│   ├── sw.js                # Service Worker (PWA)
+│   ├── app.js               # 主应用（路由/相册/查看器/分享/多选/统计）
+│   ├── crypto-core.js       # 端到端加密核心（ESM）
+│   ├── upload-util.js       # EXIF/缩略图/视频抽帧（ESM）
+│   ├── idphoto.js           # 证件照工具（ESM）
+│   ├── style-transfer.js    # 换风格页（ESM）
+│   ├── bg-replace.js        # 换背景页（ESM）
+│   ├── js/                  # 共享基础层模块
+│   │   ├── ui.js            #   UI 原语（toast/模态框/格式化）
+│   │   ├── api.js           #   API 封装 + token 管理 + Turnstile
+│   │   ├── auth.js          #   登录/解锁弹窗
+│   │   ├── enc.js           #   加密密钥管理与密文解密
+│   │   └── imgly.js         #   本地 AI 抠图共享工具
+│   ├── sw.js                # Service Worker (PWA, v16)
 │   ├── functions/s/[[id]].js # Pages Functions：/s/:id 分享 OG 卡片落地页
-│   └── vendor/              # 自托管第三方资源（exifr / onnxruntime / imgly / heic2any / qrcode）
+│   └── vendor/              # 自托管第三方资源（exifr / onnxruntime / imgly / heic2any / qrcode / hls / leaflet）
 └── worker/
     ├── src/
     │   ├── index.js         # Worker 入口、路由、ensurePhotoSchema 自动迁移

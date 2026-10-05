@@ -6,7 +6,7 @@
  */
 'use strict';
 
-const VERSION = 'v15';
+const VERSION = 'v16';
 const STATIC_CACHE = `album-static-${VERSION}`;
 const API_CACHE = `album-api-${VERSION}`;
 const THUMB_CACHE = `album-thumb-${VERSION}`;
@@ -18,6 +18,11 @@ const PRECACHE = [
   'style.css',
   'config.js',
   'app.js',
+  'js/ui.js',
+  'js/api.js',
+  'js/auth.js',
+  'js/enc.js',
+  'js/imgly.js',
   'upload-util.js',
   'idphoto.js',
   'style-transfer.js',

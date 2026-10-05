@@ -69,6 +69,24 @@ export default [
     },
   },
   {
+    // Service Worker：worker 全局作用域
+    files: ['web/sw.js'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      sourceType: 'script',
+      globals: {
+        self: 'readonly', caches: 'readonly', clients: 'readonly',
+        skipWaiting: 'readonly', registration: 'readonly',
+        fetch: 'readonly', console: 'readonly', URL: 'readonly',
+        setTimeout: 'readonly', clearTimeout: 'readonly',
+      },
+    },
+    rules: {
+      'no-console': 'off',
+      'no-empty': ['error', { allowEmptyCatch: true }],
+    },
+  },
+  {
     // Pages Functions：ESM（随 Pages 部署打包）
     files: ['web/functions/**/*.js'],
     languageOptions: {
@@ -111,10 +129,6 @@ export default [
     rules: {
       'no-console': 'off',
       'no-empty': ['error', { allowEmptyCatch: true }],
-      // 经典脚本跨文件共享全局（app.js ↔ 工具页函数互调），no-undef/no-unused-vars
-      // 必然大量误报——S5 拆分 ES modules 后恢复默认并归零
-      'no-undef': 'off',
-      'no-unused-vars': 'off',
     },
   },
 ];
