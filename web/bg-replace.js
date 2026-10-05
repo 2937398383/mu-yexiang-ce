@@ -5,7 +5,10 @@
  * 抠图后与新背景图在浏览器端 Canvas 合成，不上传服务器，零成本。
  * 背景来源：内置默认图 / 本地上传 / 从云相册选择
  */
-'use strict';
+import { toast, esc, promptModal, $view } from './js/ui.js';
+import { api, isAdmin, getAdminToken, getUnlockToken } from './js/api.js';
+import { promptAlbumPassword } from './js/auth.js';
+import { loadImgly, resourceLabel, imageToDataUri } from './js/imgly.js';
 
 // ==================== 状态 ====================
 
@@ -42,7 +45,7 @@ const DEFAULT_BG = '/bg-default.jpg';
 
 // ==================== 页面渲染 ====================
 
-function renderBgReplace() {
+export function renderBgReplace() {
   const adminMode = isAdmin();
   $view.innerHTML = `
     <div class="page-head">

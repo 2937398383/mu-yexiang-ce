@@ -13,7 +13,7 @@ const browserGlobals = {
   crypto: 'readonly', btoa: 'readonly', atob: 'readonly',
   TextEncoder: 'readonly', TextDecoder: 'readonly',
   Image: 'readonly', ImageData: 'readonly', Event: 'readonly', FileReader: 'readonly',
-  qrcode: 'readonly',
+  qrcode: 'readonly', console: 'readonly',
   IntersectionObserver: 'readonly', MutationObserver: 'readonly', ResizeObserver: 'readonly',
   CustomEvent: 'readonly', getComputedStyle: 'readonly', matchMedia: 'readonly',
   MediaSource: 'readonly', webkitAudioContext: 'readonly',
@@ -83,14 +83,13 @@ export default [
   },
   {
     // 前端 ESM（S5 拆分：入口/基础层/工具模块随批次扩大）
-    files: ['web/app.js', 'web/crypto-core.js', 'web/upload-util.js', 'web/js/**/*.js'],
+    files: ['web/app.js', 'web/crypto-core.js', 'web/upload-util.js', 'web/js/**/*.js',
+      'web/idphoto.js', 'web/style-transfer.js', 'web/bg-replace.js'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'module',
       globals: {
         ...browserGlobals,
-        // 过渡期（S5-Batch2 移除）：三个经典脚本工具页的渲染入口仍被 app.js 路由引用
-        renderIdPhoto: 'readonly', renderStyleTransfer: 'readonly', renderBgReplace: 'readonly',
       },
     },
     rules: {
@@ -102,7 +101,8 @@ export default [
     // 前端：经典脚本（无构建，script 标签全局加载；S5 各批次逐步转入上方 ESM 组）
     files: ['web/**/*.js'],
     ignores: ['web/vendor/**', 'web/functions/**',
-      'web/app.js', 'web/crypto-core.js', 'web/upload-util.js', 'web/js/**'],
+      'web/app.js', 'web/crypto-core.js', 'web/upload-util.js', 'web/js/**',
+      'web/idphoto.js', 'web/style-transfer.js', 'web/bg-replace.js'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'script',

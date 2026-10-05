@@ -12,7 +12,6 @@ import {
   api, saveToken, ADMIN_KEY, getUnlockToken, isAdmin,
   renderTurnstileInto, turnstileToken,
 } from './js/api.js';
-import { promptAlbumPassword } from './js/auth.js';
 import { extractExif, makeThumbnails, captureVideoFrame, ensureJpeg, computeDHash } from './upload-util.js';
 import {
   ENC_CHUNK, ENC_PBKDF2_ITERS,
@@ -22,6 +21,9 @@ import {
   enc_encryptMeta, enc_decryptMeta,
   enc_encryptStream, enc_decryptStream, enc_encryptBlob, enc_decryptBlob,
 } from './crypto-core.js';
+import { renderIdPhoto } from './idphoto.js';
+import { renderStyleTransfer } from './style-transfer.js';
+import { renderBgReplace } from './bg-replace.js';
 
 // ==================== 基础工具 ====================
 
@@ -3206,11 +3208,6 @@ async function render() {
 }
 
 
-// ==================== 过渡兼容层（S5-Batch2 移除） ====================
-// 三个 AI 工具页尚未 ESM 化，仍以经典脚本运行，依赖这些全局函数；
-// Batch 2 工具页改 import 后此层整体删除
-// 工具页还依赖 $view（DOM 根引用；module 顶层 const 不再进入全局词法环境）
-Object.assign(window, { toast, esc, api, isAdmin, getUnlockToken, promptAlbumPassword, $view });
 
 window.addEventListener('hashchange', render);
 initTheme();

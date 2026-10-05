@@ -5,7 +5,10 @@
  *   方案二（进阶）：云端 BiRefNet 精修（经 Worker 代理 Replicate）
  *                  发丝级边缘，每日有限免费额度
  */
-'use strict';
+import { toast, esc, promptModal, $view } from './js/ui.js';
+import { api, isAdmin, getAdminToken, getUnlockToken } from './js/api.js';
+import { promptAlbumPassword } from './js/auth.js';
+import { loadImgly, resourceLabel, imageToDataUri } from './js/imgly.js';
 
 // ==================== 证件照工具状态 ====================
 
@@ -48,7 +51,7 @@ const BG_COLORS = [
 
 // ==================== 渲染证件照页面 ====================
 
-function renderIdPhoto() {
+export function renderIdPhoto() {
   const isAdminMode = isAdmin();
   $view.innerHTML = `
     <div class="page-head">
@@ -466,22 +469,7 @@ async function loadFromAlbum(photoId) {
 
 // ==================== 方案一：浏览器本地 AI 抠图 ====================
 
-let imglyModulePromise = null;
 
-function loadImgly() {
-  if (!imglyModulePromise) {
-    imglyModulePromise = import(new URL('/vendor/imgly/index.mjs', location.href));
-  }
-  return imglyModulePromise;
-}
-
-// 资源 key → 友好名称
-function resourceLabel(key) {
-  if (key.includes('isnet_quint8')) return 'AI 模型';
-  if (key.includes('.wasm')) return 'AI 推理引擎';
-  if (key.includes('.mjs')) return 'AI 推理引擎';
-  return key;
-}
 
 function showAIStatus(mainText) {
   const statusEl = document.getElementById('idp-ai-status');
@@ -566,20 +554,7 @@ function applyProcessedBlob(blob, mode) {
 
 // ==================== 方案二：云端 BiRefNet 精修（进阶独立入口） ====================
 
-// 将图片绘制到 canvas 并输出 data URI（限制最长边，减小上传体积）
-function imageToDataUri(img, maxEdge, type = 'image/jpeg', quality = 0.92) {
-  let { width, height } = img;
-  if (Math.max(width, height) > maxEdge) {
-    const s = maxEdge / Math.max(width, height);
-    width = Math.round(width * s);
-    height = Math.round(height * s);
-  }
-  const c = document.createElement('canvas');
-  c.width = width;
-  c.height = height;
-  c.getContext('2d').drawImage(img, 0, 0, width, height);
-  return c.toDataURL(type, quality);
-}
+
 
 async function cloudRefine() {
   if (!idPhotoState.sourceImg) {
@@ -975,7 +950,7 @@ async function saveIdPhotoToAlbum() {
     await api('POST', `/photos/${r.photoId}/confirm`);
 
     toast('已保存到相册');
-    render();
+    window.render();
   }, '保存');
 }
 

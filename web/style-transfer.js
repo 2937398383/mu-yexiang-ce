@@ -4,7 +4,9 @@
  *   hd（9B）  ：高质量，每 IP 每天 3 张
  * 参考图在浏览器端压到 504px 长边（模型要求输入小于 512×512），输出 1024/1280 长边
  */
-'use strict';
+import { toast, esc, promptModal, $view } from './js/ui.js';
+import { api, isAdmin, getAdminToken, getUnlockToken } from './js/api.js';
+import { promptAlbumPassword } from './js/auth.js';
 
 // ==================== 风格定义（与服务端白名单一致） ====================
 
@@ -113,7 +115,7 @@ const stState = {
 
 // ==================== 页面渲染 ====================
 
-function renderStyleTransfer() {
+export function renderStyleTransfer() {
   const adminMode = isAdmin();
   $view.innerHTML = `
     <div class="page-head">
